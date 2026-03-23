@@ -34,7 +34,6 @@ jobs:
           import platform
           import importlib.metadata as md
           import mlx.core as mx
-
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
           print("MLX version:", md.version("mlx"))
@@ -193,9 +192,7 @@ jobs:
               patterns = [
                   r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
                   r"\bloss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"pe
-::contentReference[oaicite:1]{index=1}
-rplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
                   r"\bppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
               ]
               for pat in patterns:
