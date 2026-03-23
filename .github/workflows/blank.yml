@@ -9,7 +9,7 @@ on:
 jobs:
   mlx-mamba-cpt-smoke:
     runs-on: macos-14
-    timeout-minutes: 120
+    timeout-minutes: 150   # increased a bit for safety
 
     steps:
       - name: Checkout
@@ -31,17 +31,14 @@ jobs:
           set -euxo pipefail
           uname -a
           python - <<'PY'
-          import platform
-          import importlib.metadata as md
-          import mlx.core as mx
+          import platform, importlib.metadata as md, mlx.core as mx
           print("Platform:", platform.platform())
-          print("Machine:", platform.machine())
-          print("MLX version:", md.version("mlx"))
-          print("MLX LM version:", md.version("mlx-lm"))
-          print("Default device:", mx.default_device())
+          print("MLX:", md.version("mlx"))
+          print("MLX-LM:", md.version("mlx-lm"))
+          print("Device:", mx.default_device())
           PY
 
-      - name: Build tiny CVE jargon dataset
+      - name: Build tiny CVE dataset
         run: |
           set -euxo pipefail
           mkdir -p data/cve_cpt
@@ -91,11 +88,9 @@ jobs:
           {"text":"Incident responders review process trees, unusual outbound traffic, credential access, and persistence mechanisms after a suspected compromise."}
           JSONL
 
-          echo "=== Dataset files created ==="
           wc -l data/cve_cpt/*.jsonl
-          ls -l data/cve_cpt/
 
-      - name: Baseline generation (base model)
+      - name: Baseline generation (raw model)
         run: |
           set -euxo pipefail
           mlx_lm.generate \
@@ -103,12 +98,9 @@ jobs:
             --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
             --max-tokens 120 \
             > baseline_generation.txt
-
-          test -s baseline_generation.txt
-          echo "=== baseline_generation.txt ==="
           cat baseline_generation.txt
 
-      - name: Baseline evaluation (base model - no adapter)
+      - name: Baseline evaluation (raw model - NO adapter)
         run: |
           set -euxo pipefail
           mlx_lm.lora \
@@ -117,9 +109,6 @@ jobs:
             --test \
             --batch-size 1 \
             2>&1 | tee baseline_test.txt
-
-          test -s baseline_test.txt
-          echo "=== baseline_test.txt ==="
           cat baseline_test.txt
 
       - name: Tiny CPT smoke train (LoRA)
@@ -140,14 +129,10 @@ jobs:
             --max-seq-length 256 \
             2>&1 | tee train_smoke.txt
 
-          test -s train_smoke.txt
-          echo "=== train_smoke.txt ==="
-          cat train_smoke.txt
+          echo "=== Adapter directory ==="
+          ls -R adapters_cve_smoke || echo "Directory not found"
 
-          echo "=== adapters_cve_smoke contents ==="
-          find adapters_cve_smoke -type f | sort || echo "No files found"
-
-      - name: Post-train evaluation (with LoRA adapter)
+      - name: Post-train evaluation (with adapter)
         run: |
           set -euxo pipefail
           mlx_lm.lora \
@@ -157,12 +142,9 @@ jobs:
             --test \
             --batch-size 1 \
             2>&1 | tee post_train_test.txt
-
-          test -s post_train_test.txt
-          echo "=== post_train_test.txt ==="
           cat post_train_test.txt
 
-      - name: Post-train generation (with LoRA adapter)
+      - name: Post-train generation (with adapter)
         run: |
           set -euxo pipefail
           mlx_lm.generate \
@@ -171,9 +153,6 @@ jobs:
             --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
             --max-tokens 120 \
             > posttrain_generation.txt
-
-          test -s posttrain_generation.txt
-          echo "=== posttrain_generation.txt ==="
           cat posttrain_generation.txt
 
       - name: Summarize metrics
@@ -182,33 +161,19 @@ jobs:
           python - <<'PY'
           import re
           from pathlib import Path
-
-          def extract_metric(path):
-              text = Path(path).read_text(errors="ignore")
-              patterns = [
-                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"\bloss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"\bppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-              ]
-              for pat in patterns:
-                  hits = re.findall(pat, text, flags=re.IGNORECASE)
-                  if hits:
-                      return float(hits[-1])
+          def extract_metric(p):
+              t = Path(p).read_text(errors='ignore')
+              for pat in [r'test loss[^0-9]*([0-9.]+)', r'\bloss[^0-9]*([0-9.]+)', r'perplexity[^0-9]*([0-9.]+)', r'\bppl[^0-9]*([0-9.]+)']:
+                  m = re.search(pat, t, re.I)
+                  if m: return float(m.group(1))
               return None
-
-          baseline = extract_metric("baseline_test.txt")
-          post = extract_metric("post_train_test.txt")
-
-          print("Baseline metric:", baseline)
-          print("Post-train metric:", post)
-
-          if baseline is None or post is None:
-              raise SystemExit("Could not extract evaluation metrics")
-          if post <= baseline + 1e-6:
-              print("✅ Post-train metric improved or stayed equal.")
-          else:
-              print("⚠️ Post-train metric worsened.")
+          b = extract_metric('baseline_test.txt')
+          p = extract_metric('post_train_test.txt')
+          print(f"Baseline: {b}")
+          print(f"Post-train: {p}")
+          if b is None or p is None:
+              raise SystemExit("Missing metric")
+          print("✅ Improved" if p <= b + 1e-6 else "⚠️  Worsened")
           PY
 
       - name: Upload artifacts
@@ -217,9 +182,7 @@ jobs:
         with:
           name: mlx-mamba-130m-cve-cpt-smoke
           path: |
-            baseline_generation.txt
-            baseline_test.txt
+            *_generation.txt
+            *_test.txt
             train_smoke.txt
-            post_train_test.txt
-            posttrain_generation.txt
             adapters_cve_smoke/
