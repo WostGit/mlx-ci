@@ -8,8 +8,9 @@ jobs:
   train:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        # We keep both to monitor when the 'macos-26' optimization finally overtakes 14
+        # March 2026 Comparison: macos-14 (M1) vs macos-26 (M2/M3/M4)
         os: [macos-14, macos-26] 
     steps:
       - name: Checkout
@@ -23,16 +24,20 @@ jobs:
       - name: Install MLX
         run: pip install "mlx-lm[train]"
 
-      # THE INSPECTOR: See exactly what Apple Silicon you landed on
+      # THE FIX: Headless-safe hardware inspection
       - name: Inspect Hardware
         run: |
           echo "🚀 TARGET OS: ${{ matrix.os }}"
-          echo "--- CPU Info ---"
+          echo "--- CPU Detail ---"
           sysctl -n machdep.cpu.brand_string
-          echo "--- GPU/Cores Info ---"
-          system_profiler SPDisplaysDataType | grep "Total Number of Cores"
-          echo "--- RAM Info ---"
+          echo "--- Core Count ---"
+          echo "Logical Cores: $(sysctl -n hw.ncpu)"
+          echo "Physical Cores: $(sysctl -n hw.physicalcpu)"
+          echo "--- RAM Capacity ---"
           sysctl hw.memsize | awk '{print $2/1024/1024/1024 " GB"}'
+          echo "--- System Info ---"
+          # Only use SPHardwareDataType, avoid SPDisplaysDataType to prevent crashes
+          system_profiler SPHardwareDataType | grep -E "Model Name|Processor Name|Memory"
 
       - name: Restore Last Checkpoint
         id: cache-resume
@@ -46,7 +51,7 @@ jobs:
       - name: Prepare Data
         run: |
           mkdir -p data/cve_cpt
-          echo '{"text":"CVE-2021-44228 is a critical RCE in Log4j 2.14.1 via JNDI lookup patterns."}' > data/cve_cpt/train.jsonl
+          echo '{"text":"CVE-2021-44228: Critical RCE in Apache Log4j 2 via JNDI lookup. Patch: Update to 2.17.1."}' > data/cve_cpt/train.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
@@ -54,6 +59,7 @@ jobs:
         run: |
           RESUME_ARG=""
           if [ -f "adapters_dora/adapters.safetensors" ]; then
+            echo "🎯 RESUMING FROM PREVIOUS WEIGHTS..."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
           fi
 
