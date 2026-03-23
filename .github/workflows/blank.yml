@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  mlx-smoke-test:
+  mlx-benchmark:
     runs-on: macos-14
 
     steps:
@@ -18,47 +18,210 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Show runner info
-        run: |
-          uname -a
-          python -c "import platform; print(platform.platform()); print(platform.machine()); print(platform.processor())"
-
       - name: Install MLX
         run: |
           python -m pip install --upgrade pip
           pip install mlx
 
-      - name: Run MLX smoke test
+      - name: Show runner info
         run: |
+          uname -a
           python - <<'PY'
-          import mlx.core as mx
           import platform
-
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
-          print("Default device:", mx.default_device())
-
-          a = mx.array([1.0, 2.0, 3.0])
-          b = mx.array([4.0, 5.0, 6.0])
-          c = a + b
-
-          # Force evaluation because MLX operations are lazy
-          mx.eval(c)
-
-          print("Result:", c)
-          print("Success: MLX imported and executed.")
+          print("Processor:", platform.processor())
           PY
-      - name: Run MLX device check
+
+      - name: Run MLX benchmark
         run: |
           python - <<'PY'
+          import json
+          import math
+          import os
+          import time
+          import traceback
+
           import mlx.core as mx
 
-          print("Default device:", mx.default_device())
+          results = {
+              "platform": None,
+              "default_device": None,
+              "allocation_benchmark": [],
+              "matmul_benchmark": [],
+              "attention_benchmark": [],
+              "summary": {},
+          }
 
-          x = mx.random.normal((2, 2))
-          y = x @ x
-          mx.eval(y)
+          def sync(x):
+              mx.eval(x)
+              return x
 
-          print("Computed successfully.")
-          print(y)
+          def timed(fn, repeats=3, warmup=1):
+              for _ in range(warmup):
+                  y = fn()
+                  sync(y)
+              times = []
+              for _ in range(repeats):
+                  t0 = time.perf_counter()
+                  y = fn()
+                  sync(y)
+                  t1 = time.perf_counter()
+                  times.append(t1 - t0)
+              return min(times), sum(times) / len(times)
+
+          print("Platform benchmark starting...")
+          results["platform"] = os.popen("uname -a").read().strip()
+          results["default_device"] = str(mx.default_device())
+          print("Default device:", results["default_device"])
+
+          # ------------------------------------------------------------
+          # 1) Allocation ceiling benchmark
+          # ------------------------------------------------------------
+          # This estimates the largest single fp16 square matrix that can
+          # be allocated and touched successfully.
+          #
+          # Memory for one fp16 matrix ~= N*N*2 bytes
+          # ------------------------------------------------------------
+          alloc_sizes = [4096, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
+          largest_alloc_n = None
+
+          print("\n[1/3] Allocation benchmark")
+          for n in alloc_sizes:
+              entry = {"n": n, "ok": False, "approx_bytes": n * n * 2}
+              try:
+                  x = mx.zeros((n, n), dtype=mx.float16)
+                  sync(x)
+                  # touch it so lazy execution really materializes work
+                  y = x + 1
+                  sync(y)
+                  entry["ok"] = True
+                  largest_alloc_n = n
+                  print(f"  OK  alloc fp16 [{n}, {n}] ~ {entry['approx_bytes'] / (1024**3):.2f} GiB")
+              except Exception as e:
+                  entry["error"] = repr(e)
+                  print(f"  FAIL alloc fp16 [{n}, {n}]")
+              results["allocation_benchmark"].append(entry)
+
+          # ------------------------------------------------------------
+          # 2) Matmul throughput benchmark
+          # ------------------------------------------------------------
+          # This is the minimum compute benchmark to know whether this runner
+          # is useful for toy training / adapter finetuning experiments.
+          #
+          # FLOPs for NxN @ NxN ~= 2*N^3
+          # ------------------------------------------------------------
+          matmul_sizes = [2048, 4096, 6144, 8192]
+          print("\n[2/3] Matmul benchmark")
+
+          for n in matmul_sizes:
+              entry = {"n": n, "ok": False}
+              try:
+                  a = mx.random.normal((n, n), dtype=mx.float16)
+                  b = mx.random.normal((n, n), dtype=mx.float16)
+                  sync(a)
+                  sync(b)
+
+                  best, avg = timed(lambda: a @ b, repeats=3, warmup=1)
+                  flops = 2 * (n ** 3)
+                  tflops_best = flops / best / 1e12
+                  tflops_avg = flops / avg / 1e12
+
+                  entry.update({
+                      "ok": True,
+                      "best_seconds": best,
+                      "avg_seconds": avg,
+                      "best_tflops": tflops_best,
+                      "avg_tflops": tflops_avg,
+                  })
+                  print(f"  OK  matmul {n}x{n}: best={best:.4f}s avg={avg:.4f}s best_tflops={tflops_best:.2f}")
+              except Exception as e:
+                  entry["error"] = repr(e)
+                  print(f"  FAIL matmul {n}x{n}")
+              results["matmul_benchmark"].append(entry)
+
+          # ------------------------------------------------------------
+          # 3) Attention-memory benchmark
+          # ------------------------------------------------------------
+          # This approximates training memory pressure from attention logits.
+          # The logits tensor is [B, H, S, S], so memory grows quadratically
+          # with sequence length.
+          #
+          # This is the most important "will training fit?" proxy.
+          # ------------------------------------------------------------
+          print("\n[3/3] Attention-memory benchmark")
+
+          # Scenario A: tiny finetune-ish
+          # Scenario B: slightly larger pretrain-ish toy stress case
+          scenarios = [
+              {"name": "finetune_proxy", "B": 1, "H": 8,  "seqs": [512, 1024, 2048, 4096, 8192, 12288]},
+              {"name": "pretrain_proxy", "B": 4, "H": 16, "seqs": [256, 512, 1024, 2048, 4096]},
+          ]
+
+          for sc in scenarios:
+              scenario_result = {
+                  "name": sc["name"],
+                  "B": sc["B"],
+                  "H": sc["H"],
+                  "tests": [],
+              }
+              print(f"  Scenario: {sc['name']}  B={sc['B']} H={sc['H']}")
+              for s in sc["seqs"]:
+                  approx_bytes = sc["B"] * sc["H"] * s * s * 2  # fp16
+                  test = {
+                      "seq_len": s,
+                      "ok": False,
+                      "approx_attention_logits_bytes": approx_bytes,
+                  }
+                  try:
+                      attn = mx.zeros((sc["B"], sc["H"], s, s), dtype=mx.float16)
+                      sync(attn)
+                      # light touch
+                      z = attn + 1
+                      sync(z)
+                      test["ok"] = True
+                      print(
+                          f"    OK  seq={s:<5d} attention logits ~ {approx_bytes / (1024**3):.2f} GiB"
+                      )
+                  except Exception as e:
+                      test["error"] = repr(e)
+                      print(
+                          f"    FAIL seq={s:<5d} attention logits ~ {approx_bytes / (1024**3):.2f} GiB"
+                      )
+                  scenario_result["tests"].append(test)
+              results["attention_benchmark"].append(scenario_result)
+
+          # ------------------------------------------------------------
+          # Summary
+          # ------------------------------------------------------------
+          successful_matmuls = [x for x in results["matmul_benchmark"] if x.get("ok")]
+          best_tflops = max((x["best_tflops"] for x in successful_matmuls), default=None)
+
+          attention_summary = {}
+          for sc in results["attention_benchmark"]:
+              ok_seqs = [t["seq_len"] for t in sc["tests"] if t["ok"]]
+              attention_summary[sc["name"]] = max(ok_seqs) if ok_seqs else None
+
+          results["summary"] = {
+              "default_device": results["default_device"],
+              "largest_single_fp16_square_matrix_n": largest_alloc_n,
+              "largest_single_fp16_square_matrix_gib": (
+                  (largest_alloc_n * largest_alloc_n * 2) / (1024**3)
+                  if largest_alloc_n else None
+              ),
+              "best_matmul_tflops": best_tflops,
+              "max_attention_seq_by_scenario": attention_summary,
+          }
+
+          print("\n=== SUMMARY ===")
+          print(json.dumps(results["summary"], indent=2))
+
+          with open("mlx_benchmark_results.json", "w") as f:
+              json.dump(results, f, indent=2)
           PY
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-benchmark-results
+          path: mlx_benchmark_results.json
