@@ -1,16 +1,12 @@
 name: MLX Mamba 130M CPT Smoke Test
-
 on:
   workflow_dispatch:
   push:
-    paths:
-      - ".github/workflows/mlx-mamba-cpt.yml"
+    paths: ["*.yml"]
 
 jobs:
   mlx-mamba-cpt-smoke:
     runs-on: macos-14
-    timeout-minutes: 150
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,32 +24,22 @@ jobs:
       - name: Prepare Dataset
         run: |
           mkdir -p data/cve_cpt
-          cat > data/cve_cpt/test.jsonl <<-'JSONL'
-          {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j."}
-          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query."}
-          JSONL
-          cp data/cve_cpt/test.jsonl data/cve_cpt/train.jsonl
-          cp data/cve_cpt/test.jsonl data/cve_cpt/valid.jsonl
+          echo '{"text":"CVE-2021-44228 is a remote code execution vulnerability."}' > data/cve_cpt/train.jsonl
+          echo '{"text":"SQL injection allows unauthorized database access."}' >> data/cve_cpt/train.jsonl
+          cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
+          cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
       - name: Baseline Evaluation
         run: |
-          set -euxo pipefail
           python -c "
           import json
           from mlx_lm import load
           from mlx_lm.tuner import evaluate
-          from pathlib import Path
-          
-          # 1. Load model and tokenizer
-          model, tokenizer = load('mlx-community/mamba-130m-hf-bf16')
-          
-          # 2. Load data directly (bypassing the unstable load_dataset wrapper)
-          with open('data/cve_cpt/test.jsonl', 'r') as f:
-              test_set = [json.loads(line)['text'] for line in f]
-          
-          # 3. Evaluate
-          loss = evaluate(model, test_set, tokenizer, batch_size=1)
-          print(f'BASELINE_LOSS:{loss}')
+          m, t = load('mlx-community/mamba-130m-hf-bf16')
+          with open('data/cve_cpt/test.jsonl') as f:
+              d = [json.loads(l)['text'] for l in f]
+          l = evaluate(model=m, tokenizer=t, dataset=d, batch_size=1)
+          print(f'BASELINE_LOSS:{l}')
           " | tee baseline_test.txt
 
       - name: Training (LoRA)
@@ -62,16 +48,15 @@ jobs:
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --data data/cve_cpt \
-            --adapter-path adapters_cve_smoke \
-            --iters 20 \
+            --adapter-path adapters \
+            --iters 10 \
             --batch-size 1
 
       - name: Post-Train Evaluation
         run: |
-          # The CLI tool is stable for its own outputs; we use it here.
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters_cve_smoke \
+            --adapter-path adapters \
             --data data/cve_cpt \
             --test \
             --batch-size 1 | tee post_train_test.txt
@@ -79,17 +64,11 @@ jobs:
       - name: Performance Comparison
         run: |
           python -c "
-          import re, sys
-          from pathlib import Path
-          
-          b_txt = Path('baseline_test.txt').read_text()
-          p_txt = Path('post_train_test.txt').read_text()
-          
-          b_loss = float(re.search(r'BASELINE_LOSS:([\d.]+)', b_txt).group(1))
-          p_loss = float(re.search(r'test loss\s+([\d.]+)', p_txt).group(1))
-          
-          print(f'Baseline: {b_loss} | Post-train: {p_loss}')
-          
-          # Success if loss doesn't explode (allowing for minor noise in 20-iter runs)
-          sys.exit(0 if p_loss <= b_loss + 0.1 else 1)
+          import re, sys, pathlib
+          b = re.search(r'BASELINE_LOSS:([\d.]+)', pathlib.Path('baseline_test.txt').read_text())
+          p = re.search(r'test loss\s+([\d.]+)', pathlib.Path('post_train_test.txt').read_text())
+          if not b or not p: sys.exit(1)
+          bl, pl = float(b.group(1)), float(p.group(1))
+          print(f'B: {bl} | P: {pl}')
+          sys.exit(0 if pl <= bl + 0.1 else 1)
           "
