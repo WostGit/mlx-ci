@@ -1,4 +1,4 @@
-name: MLX Mamba 130M CPT Smoke Test
+name: MLX Mamba 130M CPT Smoke Test...
 
 on:
   workflow_dispatch: # Allows manual trigger from GitHub UI
