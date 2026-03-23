@@ -47,7 +47,7 @@ jobs:
       - name: Prepare directories and tiny CVE dataset
         run: |
           set -euxo pipefail
-          mkdir -p data/cve_cpt adapters_cve_smoke /tmp/no_adapter_dummy
+          mkdir -p data/cve_cpt adapters_cve_smoke
 
           echo "=== Writing train.jsonl ==="
           cat > data/cve_cpt/train.jsonl <<-'JSONL'
@@ -97,10 +97,6 @@ jobs:
           {"text":"Incident responders review process trees, unusual outbound traffic, credential access, and persistence mechanisms after a suspected compromise."}
           JSONL
 
-          echo "=== Dataset file counts ==="
-          wc -l data/cve_cpt/*.jsonl
-          ls -la data/cve_cpt/
-
       - name: Baseline generation (raw model - no adapter)
         run: |
           set -euxo pipefail
@@ -115,14 +111,13 @@ jobs:
       - name: Baseline evaluation (raw model - NO adapter)
         run: |
           set -euxo pipefail
-          echo "=== Starting BASELINE EVALUATION (raw model, no adapter) ==="
-          mkdir -p /tmp/no_adapter_dummy
+          echo "=== Starting BASELINE EVALUATION (raw model) ==="
+          # Note: Removed --adapter-path completely for the baseline test
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --data data/cve_cpt \
             --test \
             --batch-size 1 \
-            --adapter-path /tmp/no_adapter_dummy \
             2>&1 | tee baseline_test.txt
 
       - name: Tiny CPT smoke train (LoRA) - 20 iterations
@@ -141,9 +136,6 @@ jobs:
             --learning-rate 1e-5 \
             --max-seq-length 256 \
             2>&1 | tee train_smoke.txt
-
-          echo "=== Adapter directory after training ==="
-          ls -R adapters_cve_smoke || true
 
       - name: Post-train evaluation (with adapter)
         run: |
@@ -181,16 +173,11 @@ jobs:
                   print(f"File {filename} does not exist!")
                   return None
               text = Path(filename).read_text(errors='ignore')
-              print(f"\n--- First 1000 chars of {filename} ---")
-              print(text[:1000])
               for pat in [r'test loss[^0-9]*([0-9.]+)', r'\bloss[^0-9]*([0-9.]+)',
                           r'perplexity[^0-9]*([0-9.]+)', r'\bppl[^0-9]*([0-9.]+)']:
                   m = re.search(pat, text, re.I)
                   if m:
-                      val = float(m.group(1))
-                      print(f"Extracted {val} using pattern: {pat}")
-                      return val
-              print("No loss/perplexity metric found in file!")
+                      return float(m.group(1))
               return None
 
           b = extract_metric('baseline_test.txt')
@@ -201,7 +188,7 @@ jobs:
           print(f"Post-train loss/perplexity: {p}")
 
           if b is None or p is None:
-              print("❌ ERROR: Could not extract metrics from one or both test files")
+              print("❌ ERROR: Could not extract metrics from output files")
               exit(1)
 
           if p <= b + 1e-6:
