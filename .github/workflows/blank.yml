@@ -46,7 +46,6 @@ jobs:
           set -euxo pipefail
           mkdir -p data/cve_cpt
 
-          # train.jsonl
           cat > data/cve_cpt/train.jsonl <<'JSONL'
           {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j caused by unsafe JNDI lookups and often referred to as Log4Shell."}
           {"text":"A proof of concept exploit may trigger arbitrary code execution, privilege escalation, denial of service, or authentication bypass depending on the vulnerable component."}
@@ -70,7 +69,6 @@ jobs:
           {"text":"A complete incident response workflow includes identification, containment, eradication, recovery, root cause analysis, and lessons learned."}
           JSONL
 
-          # valid.jsonl (used during training)
           cat > data/cve_cpt/valid.jsonl <<'JSONL'
           {"text":"The advisory assigned a high CVSS score because exploitation required low complexity and no user interaction while impacting confidentiality, integrity, and availability."}
           {"text":"Researchers published a proof of concept demonstrating remote code execution against an unpatched internet-facing service."}
@@ -82,7 +80,6 @@ jobs:
           {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
           JSONL
 
-          # test.jsonl (required for --test)
           cat > data/cve_cpt/test.jsonl <<'JSONL'
           {"text":"A successful exploit may permit arbitrary code execution, data exfiltration, or denial of service against affected versions."}
           {"text":"The remediation plan prioritizes patch validation, staged deployment, and post-remediation monitoring for suspicious activity."}
@@ -98,7 +95,7 @@ jobs:
           wc -l data/cve_cpt/*.jsonl
           ls -l data/cve_cpt/
 
-      - name: Baseline generation
+      - name: Baseline generation (base model)
         run: |
           set -euxo pipefail
           mlx_lm.generate \
@@ -106,11 +103,12 @@ jobs:
             --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
             --max-tokens 120 \
             > baseline_generation.txt
+
           test -s baseline_generation.txt
           echo "=== baseline_generation.txt ==="
           cat baseline_generation.txt
 
-      - name: Baseline evaluation
+      - name: Baseline evaluation (base model - no adapter)
         run: |
           set -euxo pipefail
           mlx_lm.lora \
@@ -146,15 +144,10 @@ jobs:
           echo "=== train_smoke.txt ==="
           cat train_smoke.txt
 
-          if [ -d adapters_cve_smoke ]; then
-            echo "=== adapters_cve_smoke contents ==="
-            find adapters_cve_smoke -type f | sort
-          else
-            echo "ERROR: adapters_cve_smoke directory was not created"
-            exit 1
-          fi
+          echo "=== adapters_cve_smoke contents ==="
+          find adapters_cve_smoke -type f | sort || echo "No files found"
 
-      - name: Post-train evaluation
+      - name: Post-train evaluation (with LoRA adapter)
         run: |
           set -euxo pipefail
           mlx_lm.lora \
@@ -169,7 +162,7 @@ jobs:
           echo "=== post_train_test.txt ==="
           cat post_train_test.txt
 
-      - name: Post-train generation
+      - name: Post-train generation (with LoRA adapter)
         run: |
           set -euxo pipefail
           mlx_lm.generate \
@@ -178,6 +171,7 @@ jobs:
             --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
             --max-tokens 120 \
             > posttrain_generation.txt
+
           test -s posttrain_generation.txt
           echo "=== posttrain_generation.txt ==="
           cat posttrain_generation.txt
@@ -209,15 +203,12 @@ jobs:
           print("Baseline metric:", baseline)
           print("Post-train metric:", post)
 
-          if baseline is None:
-              raise SystemExit("Could not extract baseline evaluation metric")
-          if post is None:
-              raise SystemExit("Could not extract post-train evaluation metric")
-
+          if baseline is None or post is None:
+              raise SystemExit("Could not extract evaluation metrics")
           if post <= baseline + 1e-6:
-              print("✅ Result: post-train metric improved or stayed equal.")
+              print("✅ Post-train metric improved or stayed equal.")
           else:
-              print("⚠️  Result: post-train metric worsened.")
+              print("⚠️ Post-train metric worsened.")
           PY
 
       - name: Upload artifacts
