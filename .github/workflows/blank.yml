@@ -2,6 +2,9 @@ name: MLX Mamba 130M CPT Smoke Test
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/mlx-mamba-cpt.yml"
 
 jobs:
   mlx-mamba-cpt-smoke:
@@ -74,12 +77,20 @@ jobs:
           {"text":"Mitigations included restricting network exposure, disabling a dangerous feature, and upgrading to a fixed release from the vendor."}
           {"text":"Attackers chained an information leak with privilege escalation to gain persistent access to the target host."}
           {"text":"The bulletin recommended reviewing logs for indicators of compromise and rotating exposed credentials after patching."}
+          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
+          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
+          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
           JSONL
 
           cat > data/cve_cpt/test.jsonl <<'JSONL'
           {"text":"A successful exploit may permit arbitrary code execution, data exfiltration, or denial of service against affected versions."}
           {"text":"The remediation plan prioritizes patch validation, staged deployment, and post-remediation monitoring for suspicious activity."}
           {"text":"Security teams assess exploitability, exposure, compensating controls, and business impact when triaging a newly disclosed CVE."}
+          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
+          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
+          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
+          {"text":"Advisories frequently reference CWE identifiers, affected product branches, proof-of-concept availability, and known exploitation in the wild."}
+          {"text":"Incident responders review process trees, unusual outbound traffic, credential access, and persistence mechanisms after a suspected compromise."}
           JSONL
 
           wc -l data/cve_cpt/*.jsonl
@@ -176,38 +187,35 @@ jobs:
           import re
           from pathlib import Path
 
-          def extract_last_number(path, patterns):
+          def extract_metric(path):
               text = Path(path).read_text(errors="ignore")
+              patterns = [
+                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"\bloss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"\bppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+              ]
               for pat in patterns:
                   hits = re.findall(pat, text, flags=re.IGNORECASE)
                   if hits:
-                      return hits[-1]
+                      return float(hits[-1])
               return None
 
-          baseline = extract_last_number(
-              "baseline_test.txt",
-              [
-                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"ppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-              ],
-          )
-          post = extract_last_number(
-              "post_train_test.txt",
-              [
-                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"ppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-              ],
-          )
+          baseline = extract_metric("baseline_test.txt")
+          post = extract_metric("post_train_test.txt")
 
           print("Baseline metric:", baseline)
           print("Post-train metric:", post)
 
-          if baseline is None or post is None:
-              raise SystemExit("Could not extract eval metrics from logs")
+          if baseline is None:
+              raise SystemExit("Could not extract a baseline evaluation metric")
+          if post is None:
+              raise SystemExit("Could not extract a post-train evaluation metric")
+
+          if post <= baseline:
+              print("Result: post-train metric improved or stayed equal.")
+          else:
+              print("Result: post-train metric worsened.")
           PY
 
       - name: Upload artifacts
