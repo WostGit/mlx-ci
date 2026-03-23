@@ -2,9 +2,6 @@ name: MLX Mamba 130M CPT Smoke Test
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/mlx-mamba-cpt.yml"
 
 jobs:
   mlx-mamba-cpt-smoke:
@@ -22,23 +19,32 @@ jobs:
 
       - name: Install dependencies
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip
-          pip install "mlx-lm[train]" transformers sentencepiece huggingface_hub
+          pip install "mlx-lm[train]" sentencepiece
 
-      - name: Show runner info
+      - name: Show environment
         run: |
+          set -euxo pipefail
           uname -a
           python - <<'PY'
           import platform
+          import mlx
           import mlx.core as mx
+          import mlx_lm
+
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
+          print("MLX version:", mlx.__version__)
+          print("MLX LM version:", mlx_lm.__version__)
           print("Default device:", mx.default_device())
           PY
 
       - name: Build tiny CVE jargon dataset
         run: |
+          set -euxo pipefail
           mkdir -p data/cve_cpt
+
           cat > data/cve_cpt/train.jsonl <<'JSONL'
           {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j caused by unsafe JNDI lookups and often referred to as Log4Shell."}
           {"text":"A proof of concept exploit may trigger arbitrary code execution, privilege escalation, denial of service, or authentication bypass depending on the vulnerable component."}
@@ -76,34 +82,39 @@ jobs:
           {"text":"Security teams assess exploitability, exposure, compensating controls, and business impact when triaging a newly disclosed CVE."}
           JSONL
 
+          wc -l data/cve_cpt/*.jsonl
+
       - name: Baseline generation
         run: |
-          python - <<'PY'
-          from mlx_lm import load, generate
+          set -euxo pipefail
+          mlx_lm.generate \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
+            --max-tokens 120 \
+            > baseline_generation.txt
 
-          model_name = "mlx-community/mamba-130m-hf-bf16"
-          model, tokenizer = load(model_name)
+          test -s baseline_generation.txt
+          echo "=== baseline_generation.txt ==="
+          cat baseline_generation.txt
 
-          prompt = "Write a short security advisory about a remote code execution CVE affecting a web server:"
-          out = generate(model, tokenizer, prompt=prompt, max_tokens=120, verbose=False)
-
-          with open("baseline_generation.txt", "w") as f:
-              f.write(out)
-
-          print(out)
-          PY
-
-      - name: Baseline perplexity
+      - name: Baseline evaluation
         run: |
+          set -euxo pipefail
           python -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --data data/cve_cpt \
             --test \
             2>&1 | tee baseline_test.txt
 
+          test -s baseline_test.txt
+          echo "=== baseline_test.txt ==="
+          cat baseline_test.txt
+
       - name: Tiny CPT smoke train
-        continue-on-error: true
         run: |
+          set -euxo pipefail
+          rm -rf adapters_cve_smoke
+
           python -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
@@ -115,12 +126,24 @@ jobs:
             --steps-per-report 5 \
             --steps-per-eval 10 \
             --learning-rate 1e-5 \
-            --max-seq-length 512 \
+            --max-seq-length 256 \
             2>&1 | tee train_smoke.txt
 
-      - name: Post-train perplexity
-        continue-on-error: true
+          test -s train_smoke.txt
+          echo "=== train_smoke.txt ==="
+          cat train_smoke.txt
+
+          if [ -d adapters_cve_smoke ]; then
+            echo "=== adapters_cve_smoke contents ==="
+            find adapters_cve_smoke -maxdepth 2 -type f | sort
+          else
+            echo "Expected output directory adapters_cve_smoke was not created"
+            exit 1
+          fi
+
+      - name: Post-train evaluation
         run: |
+          set -euxo pipefail
           python -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_cve_smoke \
@@ -128,75 +151,63 @@ jobs:
             --test \
             2>&1 | tee post_train_test.txt
 
+          test -s post_train_test.txt
+          echo "=== post_train_test.txt ==="
+          cat post_train_test.txt
+
       - name: Post-train generation
-        continue-on-error: true
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          from mlx_lm import load, generate
+          set -euxo pipefail
+          mlx_lm.generate \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --adapter-path adapters_cve_smoke \
+            --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
+            --max-tokens 120 \
+            > posttrain_generation.txt
 
-          model_name = "mlx-community/mamba-130m-hf-bf16"
-          adapter_dir = "adapters_cve_smoke"
+          test -s posttrain_generation.txt
+          echo "=== posttrain_generation.txt ==="
+          cat posttrain_generation.txt
 
-          if not Path(adapter_dir).exists():
-              print("No adapter/output directory found; skipping post-train generation.")
-              raise SystemExit(0)
-
-          model, tokenizer = load(model_name, adapter_path=adapter_dir)
-
-          prompt = "Write a short security advisory about a remote code execution CVE affecting a web server:"
-          out = generate(model, tokenizer, prompt=prompt, max_tokens=120, verbose=False)
-
-          with open("posttrain_generation.txt", "w") as f:
-              f.write(out)
-
-          print(out)
-          PY
-
-      - name: Summarize result
-        if: always()
+      - name: Summarize metrics
         run: |
+          set -euxo pipefail
           python - <<'PY'
-          from pathlib import Path
           import re
+          from pathlib import Path
 
-          files = [
+          def extract_last_number(path, patterns):
+              text = Path(path).read_text(errors="ignore")
+              for pat in patterns:
+                  hits = re.findall(pat, text, flags=re.IGNORECASE)
+                  if hits:
+                      return hits[-1]
+              return None
+
+          baseline = extract_last_number(
               "baseline_test.txt",
-              "train_smoke.txt",
+              [
+                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"ppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+              ],
+          )
+          post = extract_last_number(
               "post_train_test.txt",
-              "baseline_generation.txt",
-              "posttrain_generation.txt",
-          ]
+              [
+                  r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"ppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+              ],
+          )
 
-          print("\n=== FILE STATUS ===")
-          for f in files:
-              p = Path(f)
-              print(f, "exists" if p.exists() else "missing")
+          print("Baseline metric:", baseline)
+          print("Post-train metric:", post)
 
-          def extract_loss(path):
-              p = Path(path)
-              if not p.exists():
-                  return None
-              text = p.read_text(errors="ignore")
-              matches = re.findall(r"(?:loss|Loss|ppl|PPL|perplexity|Perplexity)[^0-9]*([0-9]+(?:\.[0-9]+)?)", text)
-              return matches[-1] if matches else None
-
-          baseline = extract_loss("baseline_test.txt")
-          post = extract_loss("post_train_test.txt")
-
-          print("\n=== SMOKE TEST SUMMARY ===")
-          print("baseline metric:", baseline)
-          print("post-train metric:", post)
-
-          train_log = Path("train_smoke.txt")
-          if train_log.exists():
-              text = train_log.read_text(errors="ignore")
-              if "Traceback" in text or "Error" in text or "Exception" in text:
-                  print("train status: training command ran but may have failed or partially failed")
-              else:
-                  print("train status: training command appears to have completed")
-          else:
-              print("train status: missing train log")
+          if baseline is None or post is None:
+              raise SystemExit("Could not extract eval metrics from logs")
           PY
 
       - name: Upload artifacts
