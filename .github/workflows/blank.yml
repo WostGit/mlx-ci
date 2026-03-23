@@ -1,13 +1,15 @@
-name: MLX CI
+name: MLX Mamba 130M CPT Smoke Test
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/mlx-mamba-cpt.yml"
 
 jobs:
-  mlx-benchmark:
+  mlx-mamba-cpt-smoke:
     runs-on: macos-14
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -18,210 +20,193 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install MLX
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install mlx
+          pip install "mlx-lm[train]" transformers sentencepiece huggingface_hub
 
       - name: Show runner info
         run: |
           uname -a
           python - <<'PY'
           import platform
+          import mlx.core as mx
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
-          print("Processor:", platform.processor())
+          print("Default device:", mx.default_device())
           PY
 
-      - name: Run MLX benchmark
+      - name: Build tiny CVE jargon dataset
+        run: |
+          mkdir -p data/cve_cpt
+          cat > data/cve_cpt/train.jsonl <<'JSONL'
+          {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j caused by unsafe JNDI lookups and often referred to as Log4Shell."}
+          {"text":"A proof of concept exploit may trigger arbitrary code execution, privilege escalation, denial of service, or authentication bypass depending on the vulnerable component."}
+          {"text":"Common security remediation steps include patching to the vendor fixed version, disabling the vulnerable feature, rotating credentials, and reviewing indicators of compromise."}
+          {"text":"CVSS base score, attack vector, attack complexity, privileges required, user interaction, scope, confidentiality impact, integrity impact, and availability impact are common advisory fields."}
+          {"text":"A memory corruption bug such as a heap overflow or use after free can enable code execution when a crafted input reaches the vulnerable parser."}
+          {"text":"Server-side request forgery allows an attacker to coerce a service into making unintended outbound requests to internal resources or cloud metadata endpoints."}
+          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query, allowing data exfiltration, authentication bypass, or destructive database operations."}
+          {"text":"Cross-site scripting can be stored, reflected, or DOM-based and may allow session theft, credential harvesting, or malicious script execution in the browser."}
+          {"text":"An exploit chain may combine an information disclosure bug with a sandbox escape or local privilege escalation to achieve full system compromise."}
+          {"text":"Security advisories often mention affected versions, fixed versions, mitigation guidance, exploitation status, severity, CWE mappings, and references to upstream commits."}
+          {"text":"A directory traversal vulnerability can expose sensitive files outside the intended document root by using crafted relative path sequences."}
+          {"text":"Remote unauthenticated attackers may exploit vulnerable network services by sending malformed packets, serialized payloads, or crafted HTTP requests."}
+          {"text":"Ransomware operators frequently weaponize known vulnerabilities after public disclosure, especially when proof-of-concept code and internet-facing targets are available."}
+          {"text":"Out-of-bounds read vulnerabilities may leak memory contents including pointers, tokens, session identifiers, or other secrets useful for follow-on attacks."}
+          {"text":"Deserialization vulnerabilities arise when untrusted data is converted into executable objects without proper validation, integrity checks, or allowlisting."}
+          {"text":"A vendor bulletin may state that exploitation in the wild has been observed, increasing operational urgency for patch deployment and exposure assessment."}
+          {"text":"The vulnerable attack surface can include APIs, admin panels, message brokers, browser rendering engines, kernel drivers, and third-party libraries."}
+          {"text":"Privilege escalation allows a user or process to obtain capabilities beyond those intended by the security boundary, often reaching administrator or root."}
+          {"text":"Indicators of compromise can include anomalous child processes, outbound connections, suspicious authentication logs, or unexpected file modifications."}
+          {"text":"A complete incident response workflow includes identification, containment, eradication, recovery, root cause analysis, and lessons learned."}
+          JSONL
+
+          cat > data/cve_cpt/valid.jsonl <<'JSONL'
+          {"text":"The advisory assigned a high CVSS score because exploitation required low complexity and no user interaction while impacting confidentiality, integrity, and availability."}
+          {"text":"Researchers published a proof of concept demonstrating remote code execution against an unpatched internet-facing service."}
+          {"text":"Mitigations included restricting network exposure, disabling a dangerous feature, and upgrading to a fixed release from the vendor."}
+          {"text":"Attackers chained an information leak with privilege escalation to gain persistent access to the target host."}
+          {"text":"The bulletin recommended reviewing logs for indicators of compromise and rotating exposed credentials after patching."}
+          JSONL
+
+          cat > data/cve_cpt/test.jsonl <<'JSONL'
+          {"text":"A successful exploit may permit arbitrary code execution, data exfiltration, or denial of service against affected versions."}
+          {"text":"The remediation plan prioritizes patch validation, staged deployment, and post-remediation monitoring for suspicious activity."}
+          {"text":"Security teams assess exploitability, exposure, compensating controls, and business impact when triaging a newly disclosed CVE."}
+          JSONL
+
+      - name: Baseline generation
         run: |
           python - <<'PY'
-          import json
-          import math
-          import os
-          import time
-          import traceback
+          from mlx_lm import load, generate
 
-          import mlx.core as mx
+          model_name = "mlx-community/mamba-130m-hf-bf16"
+          model, tokenizer = load(model_name)
 
-          results = {
-              "platform": None,
-              "default_device": None,
-              "allocation_benchmark": [],
-              "matmul_benchmark": [],
-              "attention_benchmark": [],
-              "summary": {},
-          }
+          prompt = "Write a short security advisory about a remote code execution CVE affecting a web server:"
+          out = generate(model, tokenizer, prompt=prompt, max_tokens=120, verbose=False)
 
-          def sync(x):
-              mx.eval(x)
-              return x
+          with open("baseline_generation.txt", "w") as f:
+              f.write(out)
 
-          def timed(fn, repeats=3, warmup=1):
-              for _ in range(warmup):
-                  y = fn()
-                  sync(y)
-              times = []
-              for _ in range(repeats):
-                  t0 = time.perf_counter()
-                  y = fn()
-                  sync(y)
-                  t1 = time.perf_counter()
-                  times.append(t1 - t0)
-              return min(times), sum(times) / len(times)
-
-          print("Platform benchmark starting...")
-          results["platform"] = os.popen("uname -a").read().strip()
-          results["default_device"] = str(mx.default_device())
-          print("Default device:", results["default_device"])
-
-          # ------------------------------------------------------------
-          # 1) Allocation ceiling benchmark
-          # ------------------------------------------------------------
-          # This estimates the largest single fp16 square matrix that can
-          # be allocated and touched successfully.
-          #
-          # Memory for one fp16 matrix ~= N*N*2 bytes
-          # ------------------------------------------------------------
-          alloc_sizes = [4096, 8192, 12288, 16384, 20480, 24576, 28672, 32768]
-          largest_alloc_n = None
-
-          print("\n[1/3] Allocation benchmark")
-          for n in alloc_sizes:
-              entry = {"n": n, "ok": False, "approx_bytes": n * n * 2}
-              try:
-                  x = mx.zeros((n, n), dtype=mx.float16)
-                  sync(x)
-                  # touch it so lazy execution really materializes work
-                  y = x + 1
-                  sync(y)
-                  entry["ok"] = True
-                  largest_alloc_n = n
-                  print(f"  OK  alloc fp16 [{n}, {n}] ~ {entry['approx_bytes'] / (1024**3):.2f} GiB")
-              except Exception as e:
-                  entry["error"] = repr(e)
-                  print(f"  FAIL alloc fp16 [{n}, {n}]")
-              results["allocation_benchmark"].append(entry)
-
-          # ------------------------------------------------------------
-          # 2) Matmul throughput benchmark
-          # ------------------------------------------------------------
-          # This is the minimum compute benchmark to know whether this runner
-          # is useful for toy training / adapter finetuning experiments.
-          #
-          # FLOPs for NxN @ NxN ~= 2*N^3
-          # ------------------------------------------------------------
-          matmul_sizes = [2048, 4096, 6144, 8192]
-          print("\n[2/3] Matmul benchmark")
-
-          for n in matmul_sizes:
-              entry = {"n": n, "ok": False}
-              try:
-                  a = mx.random.normal((n, n), dtype=mx.float16)
-                  b = mx.random.normal((n, n), dtype=mx.float16)
-                  sync(a)
-                  sync(b)
-
-                  best, avg = timed(lambda: a @ b, repeats=3, warmup=1)
-                  flops = 2 * (n ** 3)
-                  tflops_best = flops / best / 1e12
-                  tflops_avg = flops / avg / 1e12
-
-                  entry.update({
-                      "ok": True,
-                      "best_seconds": best,
-                      "avg_seconds": avg,
-                      "best_tflops": tflops_best,
-                      "avg_tflops": tflops_avg,
-                  })
-                  print(f"  OK  matmul {n}x{n}: best={best:.4f}s avg={avg:.4f}s best_tflops={tflops_best:.2f}")
-              except Exception as e:
-                  entry["error"] = repr(e)
-                  print(f"  FAIL matmul {n}x{n}")
-              results["matmul_benchmark"].append(entry)
-
-          # ------------------------------------------------------------
-          # 3) Attention-memory benchmark
-          # ------------------------------------------------------------
-          # This approximates training memory pressure from attention logits.
-          # The logits tensor is [B, H, S, S], so memory grows quadratically
-          # with sequence length.
-          #
-          # This is the most important "will training fit?" proxy.
-          # ------------------------------------------------------------
-          print("\n[3/3] Attention-memory benchmark")
-
-          # Scenario A: tiny finetune-ish
-          # Scenario B: slightly larger pretrain-ish toy stress case
-          scenarios = [
-              {"name": "finetune_proxy", "B": 1, "H": 8,  "seqs": [512, 1024, 2048, 4096, 8192, 12288]},
-              {"name": "pretrain_proxy", "B": 4, "H": 16, "seqs": [256, 512, 1024, 2048, 4096]},
-          ]
-
-          for sc in scenarios:
-              scenario_result = {
-                  "name": sc["name"],
-                  "B": sc["B"],
-                  "H": sc["H"],
-                  "tests": [],
-              }
-              print(f"  Scenario: {sc['name']}  B={sc['B']} H={sc['H']}")
-              for s in sc["seqs"]:
-                  approx_bytes = sc["B"] * sc["H"] * s * s * 2  # fp16
-                  test = {
-                      "seq_len": s,
-                      "ok": False,
-                      "approx_attention_logits_bytes": approx_bytes,
-                  }
-                  try:
-                      attn = mx.zeros((sc["B"], sc["H"], s, s), dtype=mx.float16)
-                      sync(attn)
-                      # light touch
-                      z = attn + 1
-                      sync(z)
-                      test["ok"] = True
-                      print(
-                          f"    OK  seq={s:<5d} attention logits ~ {approx_bytes / (1024**3):.2f} GiB"
-                      )
-                  except Exception as e:
-                      test["error"] = repr(e)
-                      print(
-                          f"    FAIL seq={s:<5d} attention logits ~ {approx_bytes / (1024**3):.2f} GiB"
-                      )
-                  scenario_result["tests"].append(test)
-              results["attention_benchmark"].append(scenario_result)
-
-          # ------------------------------------------------------------
-          # Summary
-          # ------------------------------------------------------------
-          successful_matmuls = [x for x in results["matmul_benchmark"] if x.get("ok")]
-          best_tflops = max((x["best_tflops"] for x in successful_matmuls), default=None)
-
-          attention_summary = {}
-          for sc in results["attention_benchmark"]:
-              ok_seqs = [t["seq_len"] for t in sc["tests"] if t["ok"]]
-              attention_summary[sc["name"]] = max(ok_seqs) if ok_seqs else None
-
-          results["summary"] = {
-              "default_device": results["default_device"],
-              "largest_single_fp16_square_matrix_n": largest_alloc_n,
-              "largest_single_fp16_square_matrix_gib": (
-                  (largest_alloc_n * largest_alloc_n * 2) / (1024**3)
-                  if largest_alloc_n else None
-              ),
-              "best_matmul_tflops": best_tflops,
-              "max_attention_seq_by_scenario": attention_summary,
-          }
-
-          print("\n=== SUMMARY ===")
-          print(json.dumps(results["summary"], indent=2))
-
-          with open("mlx_benchmark_results.json", "w") as f:
-              json.dump(results, f, indent=2)
+          print(out)
           PY
 
-      - name: Upload benchmark results
+      - name: Baseline perplexity
+        run: |
+          python -m mlx_lm.lora \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --data data/cve_cpt \
+            --test \
+            2>&1 | tee baseline_test.txt
+
+      - name: Tiny CPT smoke train
+        continue-on-error: true
+        run: |
+          python -m mlx_lm.lora \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --train \
+            --fine-tune-type full \
+            --data data/cve_cpt \
+            --adapter-path adapters_cve_smoke \
+            --batch-size 1 \
+            --iters 20 \
+            --steps-per-report 5 \
+            --steps-per-eval 10 \
+            --learning-rate 1e-5 \
+            --max-seq-length 512 \
+            2>&1 | tee train_smoke.txt
+
+      - name: Post-train perplexity
+        continue-on-error: true
+        run: |
+          python -m mlx_lm.lora \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --adapter-path adapters_cve_smoke \
+            --data data/cve_cpt \
+            --test \
+            2>&1 | tee post_train_test.txt
+
+      - name: Post-train generation
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from mlx_lm import load, generate
+
+          model_name = "mlx-community/mamba-130m-hf-bf16"
+          adapter_dir = "adapters_cve_smoke"
+
+          if not Path(adapter_dir).exists():
+              print("No adapter/output directory found; skipping post-train generation.")
+              raise SystemExit(0)
+
+          model, tokenizer = load(model_name, adapter_path=adapter_dir)
+
+          prompt = "Write a short security advisory about a remote code execution CVE affecting a web server:"
+          out = generate(model, tokenizer, prompt=prompt, max_tokens=120, verbose=False)
+
+          with open("posttrain_generation.txt", "w") as f:
+              f.write(out)
+
+          print(out)
+          PY
+
+      - name: Summarize result
+        if: always()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          files = [
+              "baseline_test.txt",
+              "train_smoke.txt",
+              "post_train_test.txt",
+              "baseline_generation.txt",
+              "posttrain_generation.txt",
+          ]
+
+          print("\n=== FILE STATUS ===")
+          for f in files:
+              p = Path(f)
+              print(f, "exists" if p.exists() else "missing")
+
+          def extract_loss(path):
+              p = Path(path)
+              if not p.exists():
+                  return None
+              text = p.read_text(errors="ignore")
+              matches = re.findall(r"(?:loss|Loss|ppl|PPL|perplexity|Perplexity)[^0-9]*([0-9]+(?:\.[0-9]+)?)", text)
+              return matches[-1] if matches else None
+
+          baseline = extract_loss("baseline_test.txt")
+          post = extract_loss("post_train_test.txt")
+
+          print("\n=== SMOKE TEST SUMMARY ===")
+          print("baseline metric:", baseline)
+          print("post-train metric:", post)
+
+          train_log = Path("train_smoke.txt")
+          if train_log.exists():
+              text = train_log.read_text(errors="ignore")
+              if "Traceback" in text or "Error" in text or "Exception" in text:
+                  print("train status: training command ran but may have failed or partially failed")
+              else:
+                  print("train status: training command appears to have completed")
+          else:
+              print("train status: missing train log")
+          PY
+
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlx-benchmark-results
-          path: mlx_benchmark_results.json
+          name: mlx-mamba-130m-cve-cpt-smoke
+          path: |
+            baseline_generation.txt
+            baseline_test.txt
+            train_smoke.txt
+            post_train_test.txt
+            posttrain_generation.txt
