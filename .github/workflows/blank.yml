@@ -1,14 +1,12 @@
-name: MLX LoRA vs DoRA Performance Test
+name: MLX DoRA Continuous Training
 on:
-  workflow_dispatch:
+  workflow_dispatch: # <--- THIS is your "Test Now" button
+  schedule:
+    - cron: '5 * * * *' 
 
 jobs:
-  train-eval:
+  train:
     runs-on: macos-14
-    strategy:
-      matrix:
-        # This will run two jobs at the same time
-        method: ["lora", "dora"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,61 +16,54 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install "mlx-lm[train]" sentencepiece
+      - name: Install MLX
+        run: pip install "mlx-lm[train]"
 
-      - name: Prepare Dataset
+      # 1. THE RESTORE (Search for the most recent baton)
+      - name: Restore Last Checkpoint
+        id: cache-resume
+        uses: actions/cache/restore@v4
+        with:
+          path: adapters_dora
+          # We use a static key prefix so it's always searchable
+          key: dora-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            dora-checkpoint-
+
+      - name: Prepare Data
         run: |
           mkdir -p data/cve_cpt
           cat > data/cve_cpt/train.jsonl <<-'JSONL'
           {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j."}
-          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query."}
-          {"text":"Buffer overflows happen when data exceeds the allocated memory buffer."}
-          {"text":"Cross-site scripting (XSS) allows attackers to inject scripts into web pages."}
-          {"text":"Broken access control is a common security vulnerability in web apps."}
           JSONL
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
-      - name: Run Training (${{ matrix.method }})
+      # 2. THE WORK
+      - name: Train DoRA
         run: |
-          # Note: we use --fine-tune-type for the standard mlx-lm package
+          RESUME_ARG=""
+          if [ -f "adapters_dora/adapters.safetensors" ]; then
+            echo "🎯 FOUND PREVIOUS WEIGHTS. RESUMING..."
+            RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
+          else
+            echo "🌱 NO CHECKPOINT FOUND. STARTING FRESH."
+          fi
+
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
-            --fine-tune-type ${{ matrix.method }} \
+            --fine-tune-type dora \
             --data data/cve_cpt \
-            --iters 100 \
-            --learning-rate 1e-4 \
-            --batch-size 1 \
-            --adapter-path adapters_${{ matrix.method }}
+            --iters 50 \
+            --adapter-path adapters_dora \
+            $RESUME_ARG
 
-      - name: Evaluate Accuracy
-        run: |
-          echo "### Results for ${{ matrix.method }}" > report_${{ matrix.method }}.md
-          mlx_lm.lora \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters_${{ matrix.method }} \
-            --data data/cve_cpt \
-            --test >> report_${{ matrix.method }}.md
-
-      - name: Upload Results
-        uses: actions/upload-artifact@v4
+      # 3. THE SAVE (Force a new cache entry every time)
+      - name: Save Progress
+        if: always()
+        uses: actions/cache/save@v4
         with:
-          name: ${{ matrix.method }}-results
-          path: report_${{ matrix.method }}.md
-
-  summary:
-    needs: train-eval
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
-      
-      - name: Display Comparison
-        run: |
-          echo "LO-RA RESULTS:"
-          cat lora-results/report_lora.md
-          echo -e "\nDO-RA RESULTS:"
-          cat dora-results/report_dora.md
+          path: adapters_dora
+          # Adding 'run_attempt' ensures the key is unique so GitHub accepts the save
+          key: dora-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
