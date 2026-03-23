@@ -40,35 +40,19 @@ jobs:
         run: |
           set -euxo pipefail
           python -c "
-          import json
-          import mlx.core as mx
-          import mlx.nn as nn
+          import json, mlx.core as mx, mlx.nn as nn
           from mlx_lm import load
-          
-          # 1. Load
-          model, tokenizer = load('mlx-community/mamba-130m-hf-bf16')
-          
-          # 2. Loop
+          m, t = load('mlx-community/mamba-130m-hf-bf16')
           with open('data/cve_cpt/test.jsonl') as f:
               texts = [json.loads(l)['text'] for l in f]
-          
           total_loss = 0
           for text in texts:
-              tokens = mx.array(tokenizer.encode(text))[None]
-              inputs, targets = tokens[:, :-1], tokens[:, 1:]
-              
-              logits = model(inputs)
-              
-              # MLX Losses are in mlx.nn.losses
-              loss = nn.losses.cross_entropy(logits, targets)
-              avg_loss = mx.mean(loss)
-              
-              # Force execution
-              mx.eval(avg_loss)
-              total_loss += avg_loss.item()
-          
-          final_avg = total_loss / len(texts)
-          print(f'BASELINE_LOSS:{final_avg:.4f}')
+              tokens = mx.array(t.encode(text))[None]
+              logits = m(tokens[:, :-1])
+              loss = mx.mean(nn.losses.cross_entropy(logits, tokens[:, 1:]))
+              mx.eval(loss)
+              total_loss += loss.item()
+          print(f'BASELINE_LOSS:{total_loss / len(texts):.4f}')
           " | tee baseline_test.txt
 
       - name: Training (LoRA)
@@ -96,13 +80,21 @@ jobs:
           import re, sys, pathlib
           b = re.search(r'BASELINE_LOSS:([\d.]+)', pathlib.Path('baseline_test.txt').read_text())
           p = re.search(r'[Ll]oss\s+([\d.]+)', pathlib.Path('post_train_test.txt').read_text())
-          
-          if not b or not p:
-              print('Metrics missing'); sys.exit(1)
-              
           bl, pl = float(b.group(1)), float(p.group(1))
-          print(f'Baseline: {bl} | Post-train: {pl}')
-          
-          # Pass if pl <= bl + buffer
+          print(f'B: {bl} | P: {pl}')
           sys.exit(0 if pl <= bl + 0.1 else 1)
           "
+
+      - name: Fuse Model
+        run: |
+          python -m mlx_lm.fuse \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --adapter-path adapters \
+            --save-path fused_mamba_cve
+
+      - name: Upload Finished Model
+        uses: actions/upload-artifact@v4
+        with:
+          name: fused-mamba-cve-model
+          path: fused_mamba_cve/
+          retention-days: 5
