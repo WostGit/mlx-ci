@@ -1,13 +1,16 @@
-name: MLX Mamba 130M CPT Smoke Test
+name: MLX LoRA vs DoRA Comparison
 on:
   workflow_dispatch:
   push:
     paths: ["*.yml"]
 
 jobs:
-  mlx-mamba-cpt-smoke:
+  compare-methods:
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        method: ["lora", "dora"] # This runs the job twice: once for each method
 
     steps:
       - name: Checkout
@@ -36,65 +39,30 @@ jobs:
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
-      - name: Baseline Evaluation (Manual Math)
+      - name: Train (${{ matrix.method }})
         run: |
-          set -euxo pipefail
-          python -c "
-          import json, mlx.core as mx, mlx.nn as nn
-          from mlx_lm import load
-          m, t = load('mlx-community/mamba-130m-hf-bf16')
-          with open('data/cve_cpt/test.jsonl') as f:
-              texts = [json.loads(l)['text'] for l in f]
-          total_loss = 0
-          for text in texts:
-              tokens = mx.array(t.encode(text))[None]
-              logits = m(tokens[:, :-1])
-              loss = mx.mean(nn.losses.cross_entropy(logits, tokens[:, 1:]))
-              mx.eval(loss)
-              total_loss += loss.item()
-          print(f'BASELINE_LOSS:{total_loss / len(texts):.4f}')
-          " | tee baseline_test.txt
-
-      - name: Training (LoRA)
-        run: |
+          # We use 100 iterations to actually see a difference in Loss
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
+            --train-type ${{ matrix.method }} \
             --data data/cve_cpt \
-            --adapter-path adapters \
-            --iters 20 \
+            --adapter-path adapters_${{ matrix.method }} \
+            --iters 100 \
+            --learning-rate 1e-4 \
             --batch-size 1
 
-      - name: Post-Train Evaluation (CLI)
+      - name: Evaluate Accuracy (Loss)
         run: |
+          echo "RESULTS FOR ${{ matrix.method }}:"
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters \
+            --adapter-path adapters_${{ matrix.method }} \
             --data data/cve_cpt \
-            --test \
-            --batch-size 1 | tee post_train_test.txt
+            --test | tee stats_${{ matrix.method }}.txt
 
-      - name: Performance Comparison
-        run: |
-          python -c "
-          import re, sys, pathlib
-          b = re.search(r'BASELINE_LOSS:([\d.]+)', pathlib.Path('baseline_test.txt').read_text())
-          p = re.search(r'[Ll]oss\s+([\d.]+)', pathlib.Path('post_train_test.txt').read_text())
-          bl, pl = float(b.group(1)), float(p.group(1))
-          print(f'B: {bl} | P: {pl}')
-          sys.exit(0 if pl <= bl + 0.1 else 1)
-          "
-
-      - name: Fuse Model
-        run: |
-          python -m mlx_lm.fuse \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters \
-            --save-path fused_mamba_cve
-
-      - name: Upload Finished Model
+      - name: Upload Stats
         uses: actions/upload-artifact@v4
         with:
-          name: fused-mamba-cve-model
-          path: fused_mamba_cve/
-          retention-days: 5
+          name: stats-${{ matrix.method }}
+          path: stats_${{ matrix.method }}.txt
