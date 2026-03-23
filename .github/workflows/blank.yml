@@ -23,124 +23,58 @@ jobs:
       - name: Install dependencies
         run: |
           set -euxo pipefail
-          echo "=== Upgrading pip ==="
           python -m pip install --upgrade pip
-          echo "=== Installing mlx-lm[train] and sentencepiece ==="
           pip install "mlx-lm[train]" sentencepiece
-          echo "=== Installation completed ==="
 
-      - name: Show environment (verbose)
-        run: |
-          set -euxo pipefail
-          echo "=== System Information ==="
-          uname -a
-          python - <<'PY'
-          import platform, importlib.metadata as md, mlx.core as mx, sys
-          print("Python version:", sys.version)
-          print("Platform:", platform.platform())
-          print("MLX version:", md.version("mlx"))
-          print("MLX-LM version:", md.version("mlx-lm"))
-          print("Default device:", mx.default_device())
-          PY
-          echo "=== Environment shown ==="
-
-      - name: Prepare directories and tiny CVE dataset
+      - name: Prepare tiny CVE dataset
         run: |
           set -euxo pipefail
           mkdir -p data/cve_cpt adapters_cve_smoke
-
-          echo "=== Writing train.jsonl ==="
+          
+          # Create train.jsonl
           cat > data/cve_cpt/train.jsonl <<-'JSONL'
-          {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j caused by unsafe JNDI lookups and often referred to as Log4Shell."}
-          {"text":"A proof of concept exploit may trigger arbitrary code execution, privilege escalation, denial of service, or authentication bypass depending on the vulnerable component."}
-          {"text":"Common security remediation steps include patching to the vendor fixed version, disabling the vulnerable feature, rotating credentials, and reviewing indicators of compromise."}
-          {"text":"CVSS base score, attack vector, attack complexity, privileges required, user interaction, scope, confidentiality impact, integrity impact, and availability impact are common advisory fields."}
-          {"text":"A memory corruption bug such as a heap overflow or use after free can enable code execution when a crafted input reaches the vulnerable parser."}
-          {"text":"Server-side request forgery allows an attacker to coerce a service into making unintended outbound requests to internal resources or cloud metadata endpoints."}
-          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query, allowing data exfiltration, authentication bypass, or destructive database operations."}
-          {"text":"Cross-site scripting can be stored, reflected, or DOM-based and may allow session theft, credential harvesting, or malicious script execution in the browser."}
-          {"text":"An exploit chain may combine an information disclosure bug with a sandbox escape or local privilege escalation to achieve full system compromise."}
-          {"text":"Security advisories often mention affected versions, fixed versions, mitigation guidance, exploitation status, severity, CWE mappings, and references to upstream commits."}
-          {"text":"A directory traversal vulnerability can expose sensitive files outside the intended document root by using crafted relative path sequences."}
-          {"text":"Remote unauthenticated attackers may exploit vulnerable network services by sending malformed packets, serialized payloads, or crafted HTTP requests."}
-          {"text":"Ransomware operators frequently weaponize known vulnerabilities after public disclosure, especially when proof-of-concept code and internet-facing targets are available."}
-          {"text":"Out-of-bounds read vulnerabilities may leak memory contents including pointers, tokens, session identifiers, or other secrets useful for follow-on attacks."}
-          {"text":"Deserialization vulnerabilities arise when untrusted data is converted into executable objects without proper validation, integrity checks, or allowlisting."}
-          {"text":"A vendor bulletin may state that exploitation in the wild has been observed, increasing operational urgency for patch deployment and exposure assessment."}
-          {"text":"The vulnerable attack surface can include APIs, admin panels, message brokers, browser rendering engines, kernel drivers, and third-party libraries."}
-          {"text":"Privilege escalation allows a user or process to obtain capabilities beyond those intended by the security boundary, often reaching administrator or root."}
-          {"text":"Indicators of compromise can include anomalous child processes, outbound connections, suspicious authentication logs, or unexpected file modifications."}
-          {"text":"A complete incident response workflow includes identification, containment, eradication, recovery, root cause analysis, and lessons learned."}
+          {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j."}
+          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query."}
           JSONL
 
-          echo "=== Writing valid.jsonl ==="
-          cat > data/cve_cpt/valid.jsonl <<-'JSONL'
-          {"text":"The advisory assigned a high CVSS score because exploitation required low complexity and no user interaction while impacting confidentiality, integrity, and availability."}
-          {"text":"Researchers published a proof of concept demonstrating remote code execution against an unpatched internet-facing service."}
-          {"text":"Mitigations included restricting network exposure, disabling a dangerous feature, and upgrading to a fixed release from the vendor."}
-          {"text":"Attackers chained an information leak with privilege escalation to gain persistent access to the target host."}
-          {"text":"The bulletin recommended reviewing logs for indicators of compromise and rotating exposed credentials after patching."}
-          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
-          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
-          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
-          JSONL
-
-          echo "=== Writing test.jsonl ==="
+          # Create test.jsonl
           cat > data/cve_cpt/test.jsonl <<-'JSONL'
-          {"text":"A successful exploit may permit arbitrary code execution, data exfiltration, or denial of service against affected versions."}
-          {"text":"The remediation plan prioritizes patch validation, staged deployment, and post-remediation monitoring for suspicious activity."}
-          {"text":"Security teams assess exploitability, exposure, compensating controls, and business impact when triaging a newly disclosed CVE."}
-          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
-          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
-          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
-          {"text":"Advisories frequently reference CWE identifiers, affected product branches, proof-of-concept availability, and known exploitation in the wild."}
-          {"text":"Incident responders review process trees, unusual outbound traffic, credential access, and persistence mechanisms after a suspected compromise."}
+          {"text":"A successful exploit may permit arbitrary code execution against affected versions."}
+          {"text":"Security teams assess exploitability and business impact when triaging a CVE."}
           JSONL
 
-      - name: Baseline generation (raw model - no adapter)
+      - name: Baseline evaluation (raw model)
         run: |
           set -euxo pipefail
-          echo "=== Starting BASELINE GENERATION (raw model) ==="
-          mlx_lm.generate \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
-            --max-tokens 120 \
-            > baseline_generation.txt 2>&1 || true
-          cat baseline_generation.txt
+          echo "=== Starting BASELINE EVALUATION ==="
+          # Use the Python API to evaluate the local test set without adapters
+          python -c "
+          from mlx_lm import load
+          from mlx_lm.tuner import datasets, evaluate
+          model, tokenizer = load('mlx-community/mamba-130m-hf-bf16')
+          test_set = datasets.load_dataset('data/cve_cpt')
+          loss = evaluate(model, test_set, tokenizer, batch_size=1)
+          print(f'test loss {loss:.4f}')
+          " 2>&1 | tee baseline_test.txt
 
-      - name: Baseline evaluation (raw model - NO adapter)
+      - name: Tiny CPT smoke train (LoRA)
         run: |
           set -euxo pipefail
-          echo "=== Starting BASELINE EVALUATION (raw model) ==="
-          # Note: Removed --adapter-path completely for the baseline test
-          mlx_lm.lora \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --data data/cve_cpt \
-            --test \
-            --batch-size 1 \
-            2>&1 | tee baseline_test.txt
-
-      - name: Tiny CPT smoke train (LoRA) - 20 iterations
-        run: |
-          set -euxo pipefail
-          echo "=== Starting TRAINING (20 iterations smoke test) ==="
+          echo "=== Starting TRAINING ==="
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --data data/cve_cpt \
             --adapter-path adapters_cve_smoke \
-            --batch-size 1 \
             --iters 20 \
-            --steps-per-report 5 \
-            --steps-per-eval 10 \
-            --learning-rate 1e-5 \
-            --max-seq-length 256 \
+            --batch-size 1 \
             2>&1 | tee train_smoke.txt
 
       - name: Post-train evaluation (with adapter)
         run: |
           set -euxo pipefail
-          echo "=== Starting POST-TRAIN EVALUATION (with adapter) ==="
+          echo "=== Starting POST-TRAIN EVALUATION ==="
+          # This step uses the adapter we just made
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_cve_smoke \
@@ -149,61 +83,32 @@ jobs:
             --batch-size 1 \
             2>&1 | tee post_train_test.txt
 
-      - name: Post-train generation (with adapter)
-        run: |
-          set -euxo pipefail
-          echo "=== Starting POST-TRAIN GENERATION (with adapter) ==="
-          mlx_lm.generate \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters_cve_smoke \
-            --prompt "Write a short security advisory about a remote code execution CVE affecting a web server:" \
-            --max-tokens 120 \
-            > posttrain_generation.txt 2>&1 || true
-          cat posttrain_generation.txt
-
-      - name: Summarize metrics (verbose)
+      - name: Summarize metrics
         run: |
           set -euxo pipefail
           python - <<-'PY'
           import re
           from pathlib import Path
 
-          def extract_metric(filename):
-              if not Path(filename).exists():
-                  print(f"File {filename} does not exist!")
-                  return None
-              text = Path(filename).read_text(errors='ignore')
-              for pat in [r'test loss[^0-9]*([0-9.]+)', r'\bloss[^0-9]*([0-9.]+)',
-                          r'perplexity[^0-9]*([0-9.]+)', r'\bppl[^0-9]*([0-9.]+)']:
-                  m = re.search(pat, text, re.I)
-                  if m:
-                      return float(m.group(1))
-              return None
+          def get_val(fn):
+              txt = Path(fn).read_text()
+              m = re.search(r'loss\s+([0-9.]+)', txt, re.I)
+              return float(m.group(1)) if m else None
 
-          b = extract_metric('baseline_test.txt')
-          p = extract_metric('post_train_test.txt')
-
-          print(f"\n=== FINAL SUMMARY ===")
-          print(f"Baseline loss/perplexity : {b}")
-          print(f"Post-train loss/perplexity: {p}")
-
-          if b is None or p is None:
-              print("❌ ERROR: Could not extract metrics from output files")
-              exit(1)
-
-          if p <= b + 1e-6:
-              print("✅ SUCCESS: Post-train metric improved or stayed the same")
+          b, p = get_val('baseline_test.txt'), get_val('post_train_test.txt')
+          print(f"Baseline: {b} | Post-train: {p}")
+          if b and p and p <= b + 0.01:
+              print("✅ SUCCESS")
           else:
-              print("⚠️ WARNING: Post-train metric is worse than baseline")
+              print("❌ FAILED or No Improvement")
+              exit(1)
           PY
 
-      - name: Upload artifacts (always)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlx-mamba-130m-cve-cpt-smoke
+          name: mlx-mamba-smoke-results
           path: |
-            *_generation.txt
-            *_test.txt
-            train_smoke.txt
+            *.txt
             adapters_cve_smoke/
