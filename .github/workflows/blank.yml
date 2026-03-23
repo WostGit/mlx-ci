@@ -1,17 +1,14 @@
-name: MLX LoRA vs DoRA Comparison
+name: MLX LoRA vs DoRA Performance Test
 on:
   workflow_dispatch:
-  push:
-    paths: ["*.yml"]
 
 jobs:
-  compare-methods:
+  train-eval:
     runs-on: macos-14
-    timeout-minutes: 45
     strategy:
       matrix:
-        method: ["lora", "dora"] # This runs the job twice: once for each method
-
+        # This will run two jobs at the same time
+        method: ["lora", "dora"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,7 +20,6 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install "mlx-lm[train]" sentencepiece
 
       - name: Prepare Dataset
@@ -39,30 +35,44 @@ jobs:
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
-      - name: Train (${{ matrix.method }})
+      - name: Run Training (${{ matrix.method }})
         run: |
-          # We use 100 iterations to actually see a difference in Loss
+          # Note: we use --fine-tune-type for the standard mlx-lm package
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
-            --train-type ${{ matrix.method }} \
+            --fine-tune-type ${{ matrix.method }} \
             --data data/cve_cpt \
-            --adapter-path adapters_${{ matrix.method }} \
             --iters 100 \
             --learning-rate 1e-4 \
-            --batch-size 1
+            --batch-size 1 \
+            --adapter-path adapters_${{ matrix.method }}
 
-      - name: Evaluate Accuracy (Loss)
+      - name: Evaluate Accuracy
         run: |
-          echo "RESULTS FOR ${{ matrix.method }}:"
+          echo "### Results for ${{ matrix.method }}" > report_${{ matrix.method }}.md
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_${{ matrix.method }} \
             --data data/cve_cpt \
-            --test | tee stats_${{ matrix.method }}.txt
+            --test >> report_${{ matrix.method }}.md
 
-      - name: Upload Stats
+      - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: stats-${{ matrix.method }}
-          path: stats_${{ matrix.method }}.txt
+          name: ${{ matrix.method }}-results
+          path: report_${{ matrix.method }}.md
+
+  summary:
+    needs: train-eval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+      
+      - name: Display Comparison
+        run: |
+          echo "LO-RA RESULTS:"
+          cat lora-results/report_lora.md
+          echo -e "\nDO-RA RESULTS:"
+          cat dora-results/report_dora.md
