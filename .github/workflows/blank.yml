@@ -7,6 +7,8 @@ on:
 jobs:
   mlx-mamba-cpt-smoke:
     runs-on: macos-14
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,50 +26,59 @@ jobs:
       - name: Prepare Dataset
         run: |
           mkdir -p data/cve_cpt
-          echo '{"text":"CVE-2021-44228 is a remote code execution vulnerability."}' > data/cve_cpt/train.jsonl
-          echo '{"text":"SQL injection allows unauthorized database access."}' >> data/cve_cpt/train.jsonl
+          # Use 5-10 examples to get a more stable loss average
+          cat > data/cve_cpt/train.jsonl <<-'JSONL'
+          {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j."}
+          {"text":"SQL injection occurs when unsanitized user input is concatenated into a query."}
+          {"text":"Buffer overflows happen when data exceeds the allocated memory buffer."}
+          {"text":"Cross-site scripting (XSS) allows attackers to inject scripts into web pages."}
+          {"text":"Broken access control is a common security vulnerability in web apps."}
+          JSONL
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
-      - name: Baseline Evaluation
+      - name: Baseline Evaluation (Manual Loss)
         run: |
           set -euxo pipefail
           python -c "
           import json
           import mlx.core as mx
           from mlx_lm import load
-          from mlx_lm.tuner import evaluate
           
           # 1. Load model and tokenizer
           model, tokenizer = load('mlx-community/mamba-130m-hf-bf16')
           
-          # 2. Load and Tokenize data (evaluate now expects token IDs)
+          # 2. Manual evaluation (Immune to API parameter changes)
           with open('data/cve_cpt/test.jsonl') as f:
               texts = [json.loads(l)['text'] for l in f]
           
-          # Convert strings to lists of token IDs
-          tokenized_data = [tokenizer.encode(t) for t in texts]
+          total_loss = 0
+          for text in texts:
+              tokens = mx.array(tokenizer.encode(text))[None]
+              inputs, targets = tokens[:, :-1], tokens[:, 1:]
+              logits = model(inputs)
+              loss = mx.mean(mx.softmax_cross_entropy(logits, targets))
+              total_loss += loss.item()
           
-          # 3. Evaluate (Signature: model, dataset, loss, batch_size, ...)
-          # In recent MLX, evaluate is simplified. We use positional args for safety.
-          loss_val = evaluate(model, tokenized_data, batch_size=1)
-          
-          print(f'BASELINE_LOSS:{loss_val}')
+          avg_loss = total_loss / len(texts)
+          print(f'BASELINE_LOSS:{avg_loss:.4f}')
           " | tee baseline_test.txt
 
       - name: Training (LoRA)
         run: |
+          set -euxo pipefail
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --data data/cve_cpt \
             --adapter-path adapters \
-            --iters 10 \
+            --iters 20 \
             --batch-size 1
 
-      - name: Post-Train Evaluation
+      - name: Post-Train Evaluation (CLI)
         run: |
-          # CLI uses the adapter, so it handles its own internal tokenization logic
+          set -euxo pipefail
+          # The CLI is much more stable than the internal evaluate() function
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters \
@@ -77,20 +88,26 @@ jobs:
 
       - name: Performance Comparison
         run: |
+          set -euxo pipefail
           python -c "
           import re, sys, pathlib
-          b_file = pathlib.Path('baseline_test.txt').read_text()
-          p_file = pathlib.Path('post_train_test.txt').read_text()
+          b_text = pathlib.Path('baseline_test.txt').read_text()
+          p_text = pathlib.Path('post_train_test.txt').read_text()
           
-          b_match = re.search(r'BASELINE_LOSS:([\d.]+)', b_file)
-          p_match = re.search(r'[Ll]oss\s+([\d.]+)', p_file)
+          b_match = re.search(r'BASELINE_LOSS:([\d.]+)', b_text)
+          p_match = re.search(r'[Ll]oss\s+([\d.]+)', p_text)
           
           if not b_match or not p_match:
-              print('Metrics not found. B:', b_match, 'P:', p_match)
+              print(f'Missing metrics. Baseline Match: {bool(b_match)}, Post-train Match: {bool(p_match)}')
               sys.exit(1)
               
           bl, pl = float(b_match.group(1)), float(p_match.group(1))
-          print(f'Baseline: {bl} | Post-train: {pl}')
-          # Pass if post-train loss is lower or within noise margin
-          sys.exit(0 if pl <= bl + 0.1 else 1)
+          print(f'Baseline Loss: {bl} | Post-train Loss: {pl}')
+          
+          # Pass if training improved the model or stayed within a tiny error margin
+          if pl <= bl + 0.05:
+              print('✅ SUCCESS: Model improved or maintained performance.')
+          else:
+              print('❌ FAILURE: Model diverged.')
+              sys.exit(1)
           "
