@@ -48,3 +48,17 @@ jobs:
           print("Result:", c)
           print("Success: MLX imported and executed.")
           PY
+      - name: Run MLX device check
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+
+          print("Default device:", mx.default_device())
+
+          x = mx.random.normal((2, 2))
+          y = x @ x
+          mx.eval(y)
+
+          print("Computed successfully.")
+          print(y)
+          PY
