@@ -24,7 +24,6 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          # Use the extras for training + sentencepiece
           pip install "mlx-lm[train]" sentencepiece
 
       - name: Show environment
@@ -47,6 +46,7 @@ jobs:
           set -euxo pipefail
           mkdir -p data/cve_cpt
 
+          # train.jsonl
           cat > data/cve_cpt/train.jsonl <<'JSONL'
           {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j caused by unsafe JNDI lookups and often referred to as Log4Shell."}
           {"text":"A proof of concept exploit may trigger arbitrary code execution, privilege escalation, denial of service, or authentication bypass depending on the vulnerable component."}
@@ -70,9 +70,33 @@ jobs:
           {"text":"A complete incident response workflow includes identification, containment, eradication, recovery, root cause analysis, and lessons learned."}
           JSONL
 
-          # (valid.jsonl and test.jsonl stay the same — omitted for brevity, keep your original content)
+          # valid.jsonl (used during training)
+          cat > data/cve_cpt/valid.jsonl <<'JSONL'
+          {"text":"The advisory assigned a high CVSS score because exploitation required low complexity and no user interaction while impacting confidentiality, integrity, and availability."}
+          {"text":"Researchers published a proof of concept demonstrating remote code execution against an unpatched internet-facing service."}
+          {"text":"Mitigations included restricting network exposure, disabling a dangerous feature, and upgrading to a fixed release from the vendor."}
+          {"text":"Attackers chained an information leak with privilege escalation to gain persistent access to the target host."}
+          {"text":"The bulletin recommended reviewing logs for indicators of compromise and rotating exposed credentials after patching."}
+          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
+          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
+          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
+          JSONL
 
+          # test.jsonl (required for --test)
+          cat > data/cve_cpt/test.jsonl <<'JSONL'
+          {"text":"A successful exploit may permit arbitrary code execution, data exfiltration, or denial of service against affected versions."}
+          {"text":"The remediation plan prioritizes patch validation, staged deployment, and post-remediation monitoring for suspicious activity."}
+          {"text":"Security teams assess exploitability, exposure, compensating controls, and business impact when triaging a newly disclosed CVE."}
+          {"text":"Threat intelligence reports often correlate exploit activity, vulnerable product versions, and observed indicators of compromise across multiple incidents."}
+          {"text":"Patch management workflows often include asset discovery, version verification, staged rollout, rollback planning, and verification of remediation coverage."}
+          {"text":"Exploitability increases when internet-facing services expose vulnerable endpoints without segmentation, filtering, or compensating controls."}
+          {"text":"Advisories frequently reference CWE identifiers, affected product branches, proof-of-concept availability, and known exploitation in the wild."}
+          {"text":"Incident responders review process trees, unusual outbound traffic, credential access, and persistence mechanisms after a suspected compromise."}
+          JSONL
+
+          echo "=== Dataset files created ==="
           wc -l data/cve_cpt/*.jsonl
+          ls -l data/cve_cpt/
 
       - name: Baseline generation
         run: |
@@ -83,29 +107,31 @@ jobs:
             --max-tokens 120 \
             > baseline_generation.txt
           test -s baseline_generation.txt
+          echo "=== baseline_generation.txt ==="
           cat baseline_generation.txt
 
       - name: Baseline evaluation
         run: |
           set -euxo pipefail
-          python -m mlx_lm.lora \
+          mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --data data/cve_cpt \
             --test \
             --batch-size 1 \
             2>&1 | tee baseline_test.txt
+
           test -s baseline_test.txt
+          echo "=== baseline_test.txt ==="
           cat baseline_test.txt
 
-      - name: Tiny CPT smoke train (full fine-tune)
+      - name: Tiny CPT smoke train (LoRA)
         run: |
           set -euxo pipefail
           rm -rf adapters_cve_smoke
 
-          python -m mlx_lm.lora \
+          mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
-            --fine-tune-type full \
             --data data/cve_cpt \
             --adapter-path adapters_cve_smoke \
             --batch-size 1 \
@@ -117,6 +143,7 @@ jobs:
             2>&1 | tee train_smoke.txt
 
           test -s train_smoke.txt
+          echo "=== train_smoke.txt ==="
           cat train_smoke.txt
 
           if [ -d adapters_cve_smoke ]; then
@@ -130,14 +157,16 @@ jobs:
       - name: Post-train evaluation
         run: |
           set -euxo pipefail
-          python -m mlx_lm.lora \
+          mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_cve_smoke \
             --data data/cve_cpt \
             --test \
             --batch-size 1 \
             2>&1 | tee post_train_test.txt
+
           test -s post_train_test.txt
+          echo "=== post_train_test.txt ==="
           cat post_train_test.txt
 
       - name: Post-train generation
@@ -150,6 +179,7 @@ jobs:
             --max-tokens 120 \
             > posttrain_generation.txt
           test -s posttrain_generation.txt
+          echo "=== posttrain_generation.txt ==="
           cat posttrain_generation.txt
 
       - name: Summarize metrics
@@ -184,7 +214,7 @@ jobs:
           if post is None:
               raise SystemExit("Could not extract post-train evaluation metric")
 
-          if post <= baseline + 1e-6:   # small tolerance
+          if post <= baseline + 1e-6:
               print("✅ Result: post-train metric improved or stayed equal.")
           else:
               print("⚠️  Result: post-train metric worsened.")
