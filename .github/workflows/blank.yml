@@ -1,0 +1,50 @@
+name: MLX CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  mlx-smoke-test:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Show runner info
+        run: |
+          uname -a
+          python -c "import platform; print(platform.platform()); print(platform.machine()); print(platform.processor())"
+
+      - name: Install MLX
+        run: |
+          python -m pip install --upgrade pip
+          pip install mlx
+
+      - name: Run MLX smoke test
+        run: |
+          python - <<'PY'
+          import mlx.core as mx
+          import platform
+
+          print("Platform:", platform.platform())
+          print("Machine:", platform.machine())
+          print("Default device:", mx.default_device())
+
+          a = mx.array([1.0, 2.0, 3.0])
+          b = mx.array([4.0, 5.0, 6.0])
+          c = a + b
+
+          # Force evaluation because MLX operations are lazy
+          mx.eval(c)
+
+          print("Result:", c)
+          print("Success: MLX imported and executed.")
+          PY
