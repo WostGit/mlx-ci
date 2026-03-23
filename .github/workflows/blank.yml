@@ -32,14 +32,13 @@ jobs:
           uname -a
           python - <<'PY'
           import platform
-          import mlx
+          import importlib.metadata as md
           import mlx.core as mx
-          import mlx_lm
 
           print("Platform:", platform.platform())
           print("Machine:", platform.machine())
-          print("MLX version:", mlx.__version__)
-          print("MLX LM version:", mlx_lm.__version__)
+          print("MLX version:", md.version("mlx"))
+          print("MLX LM version:", md.version("mlx-lm"))
           print("Default device:", mx.default_device())
           PY
 
@@ -115,6 +114,7 @@ jobs:
             --model mlx-community/mamba-130m-hf-bf16 \
             --data data/cve_cpt \
             --test \
+            --batch-size 1 \
             2>&1 | tee baseline_test.txt
 
           test -s baseline_test.txt
@@ -160,6 +160,7 @@ jobs:
             --adapter-path adapters_cve_smoke \
             --data data/cve_cpt \
             --test \
+            --batch-size 1 \
             2>&1 | tee post_train_test.txt
 
           test -s post_train_test.txt
@@ -192,7 +193,9 @@ jobs:
               patterns = [
                   r"test loss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
                   r"\bloss[^0-9]*([0-9]+(?:\.[0-9]+)?)",
-                  r"perplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
+                  r"pe
+::contentReference[oaicite:1]{index=1}
+rplexity[^0-9]*([0-9]+(?:\.[0-9]+)?)",
                   r"\bppl[^0-9]*([0-9]+(?:\.[0-9]+)?)",
               ]
               for pat in patterns:
