@@ -1,12 +1,16 @@
 name: MLX DoRA Continuous Training
 on:
-  workflow_dispatch: # <--- THIS is your "Test Now" button
+  workflow_dispatch:
   schedule:
     - cron: '5 * * * *' 
 
 jobs:
   train:
-    runs-on: macos-14
+    # This now tests on the latest M4 hardware (macos-26)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-14, macos-26] # Parallel test: M1 vs M4
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,51 +23,47 @@ jobs:
       - name: Install MLX
         run: pip install "mlx-lm[train]"
 
-      # 1. THE RESTORE (Search for the most recent baton)
       - name: Restore Last Checkpoint
         id: cache-resume
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
-          # We use a static key prefix so it's always searchable
-          key: dora-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          key: dora-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            dora-checkpoint-
+            dora-${{ matrix.os }}-
 
       - name: Prepare Data
         run: |
           mkdir -p data/cve_cpt
+          # We provide at least 1 line. Using --batch-size 1 below avoids the error.
           cat > data/cve_cpt/train.jsonl <<-'JSONL'
           {"text":"CVE-2021-44228 is a remote code execution vulnerability in Apache Log4j."}
           JSONL
           cp data/cve_cpt/train.jsonl data/cve_cpt/test.jsonl
           cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl
 
-      # 2. THE WORK
       - name: Train DoRA
         run: |
           RESUME_ARG=""
           if [ -f "adapters_dora/adapters.safetensors" ]; then
             echo "🎯 FOUND PREVIOUS WEIGHTS. RESUMING..."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
-          else
-            echo "🌱 NO CHECKPOINT FOUND. STARTING FRESH."
           fi
 
+          # FIX: Added --batch-size 1 to handle small datasets
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --fine-tune-type dora \
             --data data/cve_cpt \
+            --batch-size 1 \
             --iters 50 \
             --adapter-path adapters_dora \
             $RESUME_ARG
 
-      # 3. THE SAVE (Force a new cache entry every time)
       - name: Save Progress
         if: always()
         uses: actions/cache/save@v4
         with:
           path: adapters_dora
-          # Adding 'run_attempt' ensures the key is unique so GitHub accepts the save
-          key: dora-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}
+          key: dora-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
