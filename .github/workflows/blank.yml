@@ -31,15 +31,28 @@ jobs:
 
       - name: Baseline Evaluation
         run: |
+          set -euxo pipefail
           python -c "
           import json
+          import mlx.core as mx
           from mlx_lm import load
           from mlx_lm.tuner import evaluate
-          m, t = load('mlx-community/mamba-130m-hf-bf16')
+          
+          # 1. Load model and tokenizer
+          model, tokenizer = load('mlx-community/mamba-130m-hf-bf16')
+          
+          # 2. Load and Tokenize data (evaluate now expects token IDs)
           with open('data/cve_cpt/test.jsonl') as f:
-              d = [json.loads(l)['text'] for l in f]
-          l = evaluate(model=m, tokenizer=t, dataset=d, batch_size=1)
-          print(f'BASELINE_LOSS:{l}')
+              texts = [json.loads(l)['text'] for l in f]
+          
+          # Convert strings to lists of token IDs
+          tokenized_data = [tokenizer.encode(t) for t in texts]
+          
+          # 3. Evaluate (Signature: model, dataset, loss, batch_size, ...)
+          # In recent MLX, evaluate is simplified. We use positional args for safety.
+          loss_val = evaluate(model, tokenized_data, batch_size=1)
+          
+          print(f'BASELINE_LOSS:{loss_val}')
           " | tee baseline_test.txt
 
       - name: Training (LoRA)
@@ -54,6 +67,7 @@ jobs:
 
       - name: Post-Train Evaluation
         run: |
+          # CLI uses the adapter, so it handles its own internal tokenization logic
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters \
@@ -65,10 +79,18 @@ jobs:
         run: |
           python -c "
           import re, sys, pathlib
-          b = re.search(r'BASELINE_LOSS:([\d.]+)', pathlib.Path('baseline_test.txt').read_text())
-          p = re.search(r'test loss\s+([\d.]+)', pathlib.Path('post_train_test.txt').read_text())
-          if not b or not p: sys.exit(1)
-          bl, pl = float(b.group(1)), float(p.group(1))
-          print(f'B: {bl} | P: {pl}')
+          b_file = pathlib.Path('baseline_test.txt').read_text()
+          p_file = pathlib.Path('post_train_test.txt').read_text()
+          
+          b_match = re.search(r'BASELINE_LOSS:([\d.]+)', b_file)
+          p_match = re.search(r'[Ll]oss\s+([\d.]+)', p_file)
+          
+          if not b_match or not p_match:
+              print('Metrics not found. B:', b_match, 'P:', p_match)
+              sys.exit(1)
+              
+          bl, pl = float(b_match.group(1)), float(p_match.group(1))
+          print(f'Baseline: {bl} | Post-train: {pl}')
+          # Pass if post-train loss is lower or within noise margin
           sys.exit(0 if pl <= bl + 0.1 else 1)
           "
