@@ -2,66 +2,64 @@ name: CVE Expert 6-Hour Marathon
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *' # Automated daily "Deep Learning" session
+    - cron: '0 0 * * *'
 
 jobs:
   train:
     runs-on: macos-26
     timeout-minutes: 355
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip' # Speeds up subsequent runs
 
       - name: Install AI Stack
         run: |
-          pip install "mlx-lm[train]" datasets huggingface_hub
+          python -m pip install --upgrade pip
+          python -m pip install "mlx-lm[train]" datasets huggingface_hub
           mkdir -p data/cve_cpt adapters_dora
 
       - name: Stream Real CVE Dataset
         run: |
-          python3 -c '''
+          python -c "
           from datasets import load_dataset
           import json, os
-          print("🛰️ Connecting to Hugging Face...")
           try:
-              ds = load_dataset("Bouquets/Cybersecurity-LLM-CVE", split="train", streaming=True)
-              
-              def format_cve(ex):
-                  cve_id = ex.get("CVE", "Unknown")
-                  desc = ex.get("Description", "No description available.")
-                  # Clean newline characters to keep JSONL valid
-                  desc = desc.replace("\n", " ").strip()
-                  return {"text": f"### VULNERABILITY: {cve_id}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply vendor updates."}
-
-              with open("data/cve_cpt/train.jsonl", "w") as f:
+              print('🛰️ Streaming real-world CVE data...')
+              ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
+              with open('data/cve_cpt/train.jsonl', 'w') as f:
                   for i, entry in enumerate(ds.take(5000)):
-                      f.write(json.dumps(format_cve(entry)) + "\n")
-              
-              os.system("cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl")
-              print(f"✅ Dataset Prepared with {i+1} records.")
+                      cve = entry.get('CVE', 'Unknown')
+                      desc = entry.get('Description', 'N/A').replace('\n', ' ')
+                      payload = {'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply patches.'}
+                      f.write(json.dumps(payload) + '\n')
+              os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
+              print(f'✅ {i+1} records ready.')
           except Exception as e:
-              print(f"❌ Data Stream Error: {e}")
-              exit(1)
-          '''
+              print(f'❌ Stream failed: {e}'); exit(1)
+          "
 
-      - name: Restore Evolution Cache
+      - name: Restore Previous Day Brain
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
           key: cve-brain-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            cve-brain-v2-
+          restore-keys: cve-brain-v2-
 
       - name: 6-Hour Continuous Training
         run: |
           RESUME_ARG=""
-          if [ -f "adapters_dora/adapters.safetensors" ]; then
+          if [ -f "adapters_dora/adapter_config.json" ]; then
             echo "🎯 RESUMING: Previous Brain weights detected."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
           fi
 
-          # High iters; the timeout-minutes handles the 6-hour exit
-          mlx_lm.lora \
+          python -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --fine-tune-type dora \
@@ -76,13 +74,16 @@ jobs:
       - name: Test the Brain (Inference)
         if: always()
         run: |
-          echo "--- Testing Model Knowledge ---"
-          # This checks if the model actually "absorbed" the Log4j info
-          mlx_lm.generate \
-            --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters_dora \
-            --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
-            --max-tokens 100
+          if [ -f "adapters_dora/adapter_config.json" ]; then
+            echo "--- Evaluation: Log4j (CVE-2021-44228) ---"
+            python -m mlx_lm.generate \
+              --model mlx-community/mamba-130m-hf-bf16 \
+              --adapter-path adapters_dora \
+              --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
+              --max-tokens 100
+          else
+            echo "⏭️ Skipping test: No adapter file created yet."
+          fi
 
       - name: Save Evolved Brain
         if: always()
