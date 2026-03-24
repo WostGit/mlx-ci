@@ -1,10 +1,15 @@
-name: "USENIX-AE: Mamba-DoRA-Fixed"
+name: "USENIX-AE: Mamba-DoRA-Resumable"
 on:
   workflow_dispatch:
+    inputs:
+      reason:
+        description: 'DoRA Hard Dataset Run'
+        required: false
+        default: 'Big-Vul C++ DoRA Training'
 
 jobs:
   research-marathon:
-    runs-on: macos-15  # Using 15 for better stability with current MLX
+    runs-on: macos-15
     timeout-minutes: 355
     steps:
       - name: 1. Clone Research Artifact
@@ -17,25 +22,24 @@ jobs:
           pip install "mlx-lm>=0.19.0" datasets huggingface_hub
           mkdir -p data/big_vul adapters_dora results
 
-      - name: 3. Extract & Pre-Filter Data (The "OOM Shield")
+      - name: 3. Extract & Pre-Filter Data (OOM Shield)
         run: |
           source venv/bin/activate
           python3 -c "
           from datasets import load_dataset
           import json, os, random
           try:
-              print('🛰️ Pulling Big-Vul...')
+              print('🛰️ Pulling Big-Vul Streaming...')
               ds = load_dataset('MickyMike/cvefixes_bigvul', split='train', streaming=True)
               buffer = []
-              # We only take snippets that fit within a 512-token window (~2000 chars)
-              # This prevents the 'malloc' error during tokenization.
+              # Filtering for snippets < 1800 chars (~512 tokens) to prevent malloc errors
               for entry in ds.take(10000):
                   v = entry.get('source', '')
                   f = entry.get('target', '')
                   if v and f and len(v) < 1800 and len(f) < 1800:
                       text = f'### VULNERABLE:\n{v}\n\n### FIXED:\n{f}'
                       buffer.append({'text': text})
-                  if len(buffer) >= 3000: break # Sufficient for a 1000-iter run
+                  if len(buffer) >= 4000: break
               
               random.shuffle(buffer)
               with open('data/big_vul/train.jsonl', 'w') as f:
@@ -46,27 +50,49 @@ jobs:
               print(f'❌ Error: {e}'); exit(1)
           "
 
-      - name: 5. Execute DoRA Training (Memory Restricted)
+      - name: 4. Restore State (Cache)
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            adapters_dora
+            venv
+          # Using a base key to allow fuzzy matching (restore-keys)
+          key: cve-dora-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cve-dora-v3-
+
+      - name: 5. Execute DoRA Training (Smart Resume)
         run: |
           source venv/bin/activate
           set -o pipefail
-          # MLX_MAX_MB limits the cache to leave room for the OS (14GB total)
+          
+          # 14GB Runner Safe limit: 9GB for MLX
           export MLX_MAX_MB=9000
+          
+          # RESUME LOGIC: Check if adapters exist from a previous run
+          RESUME_FLAG=""
+          if [ -f "adapters_dora/adapters.safetensors" ]; then
+            echo "🔄 Found existing adapters. Resuming from last checkpoint..."
+            RESUME_FLAG="--resume-adapter-file adapters_dora/adapters.safetensors"
+          fi
+
           python -m mlx_lm lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --fine-tune-type dora \
             --data data/big_vul \
             --iters 1000 \
-            --save-every 500 \
+            --save-every 250 \
             --batch-size 1 \
             --max-seq-length 512 \
-            --adapter-path adapters_dora 2>&1 | tee results/dora_train_log.txt
+            --adapter-path adapters_dora \
+            $RESUME_FLAG 2>&1 | tee results/dora_train_log.txt
 
       - name: 6. Automated Audit Test
         if: success()
         run: |
           source venv/bin/activate
+          echo "📊 Testing DoRA Vulnerability Repair..."
           python -m mlx_lm generate \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_dora \
@@ -82,3 +108,12 @@ jobs:
           path: |
             results/
             adapters_dora/
+
+      - name: 8. Update Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            adapters_dora
+            venv
+          key: cve-dora-v3-${{ github.run_id }}-${{ github.run_attempt }}
