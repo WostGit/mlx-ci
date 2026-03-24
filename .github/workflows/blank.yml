@@ -1,15 +1,10 @@
-name: "USENIX-AE: Mamba-DoRA-Hard-Code-Optimized"
+name: "USENIX-AE: Mamba-DoRA-Fixed"
 on:
   workflow_dispatch:
-    inputs:
-      reason:
-        description: 'DoRA Hard Dataset Run'
-        required: false
-        default: 'Big-Vul C++ DoRA Training'
 
 jobs:
   research-marathon:
-    runs-on: macos-15 # Using 15 is often more stable/available than 26 for MLX
+    runs-on: macos-15  # Using 15 for better stability with current MLX
     timeout-minutes: 355
     steps:
       - name: 1. Clone Research Artifact
@@ -19,50 +14,44 @@ jobs:
         run: |
           python3 -m venv venv
           source venv/bin/activate
-          # Use specific versions for stability
           pip install "mlx-lm>=0.19.0" datasets huggingface_hub
           mkdir -p data/big_vul adapters_dora results
 
-      - name: 3. Extract Vulnerable Code (Subset for Stability)
+      - name: 3. Extract & Pre-Filter Data (The "OOM Shield")
         run: |
           source venv/bin/activate
           python3 -c "
           from datasets import load_dataset
           import json, os, random
           try:
-              # Reduced to 5000 samples to prevent Disk/RAM pressure during prep
+              print('🛰️ Pulling Big-Vul...')
               ds = load_dataset('MickyMike/cvefixes_bigvul', split='train', streaming=True)
               buffer = []
-              for i, entry in enumerate(ds.take(5000)):
+              # We only take snippets that fit within a 512-token window (~2000 chars)
+              # This prevents the 'malloc' error during tokenization.
+              for entry in ds.take(10000):
                   v = entry.get('source', '')
                   f = entry.get('target', '')
-                  if v and f:
-                      text = f'### VULNERABLE C++:\n{v}\n\n### FIXED CODE:\n{f}'
+                  if v and f and len(v) < 1800 and len(f) < 1800:
+                      text = f'### VULNERABLE:\n{v}\n\n### FIXED:\n{f}'
                       buffer.append({'text': text})
+                  if len(buffer) >= 3000: break # Sufficient for a 1000-iter run
+              
               random.shuffle(buffer)
               with open('data/big_vul/train.jsonl', 'w') as f:
                   for line in buffer: f.write(json.dumps(line) + '\n')
               os.system('cp data/big_vul/train.jsonl data/big_vul/valid.jsonl')
-              print(f'✅ Prepared {len(buffer)} pairs.')
+              print(f'✅ Prepared {len(buffer)} filtered pairs.')
           except Exception as e:
               print(f'❌ Error: {e}'); exit(1)
           "
 
-      - name: 4. Restore State
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            adapters_dora
-            venv
-          key: cve-dora-v2-${{ github.run_id }}
-          restore-keys: |
-            cve-dora-v2-
-
-      - name: 5. Execute DoRA Training (OOM Prevention)
+      - name: 5. Execute DoRA Training (Memory Restricted)
         run: |
           source venv/bin/activate
-          # set -o pipefail ensures the job fails if the python command crashes
           set -o pipefail
+          # MLX_MAX_MB limits the cache to leave room for the OS (14GB total)
+          export MLX_MAX_MB=9000
           python -m mlx_lm lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
@@ -71,20 +60,17 @@ jobs:
             --iters 1000 \
             --save-every 500 \
             --batch-size 1 \
-            --max-seq-length 1024 \
-            --learning-rate 1e-5 \
+            --max-seq-length 512 \
             --adapter-path adapters_dora 2>&1 | tee results/dora_train_log.txt
 
       - name: 6. Automated Audit Test
-        # Only run if training actually finished and produced the adapter
         if: success()
         run: |
           source venv/bin/activate
-          echo "📊 Testing DoRA Vulnerability Repair..."
           python -m mlx_lm generate \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_dora \
-            --prompt '### VULNERABLE C++:\nvoid main() { char buf[8]; strcpy(buf, input); }\n\n### FIXED CODE:\n' \
+            --prompt '### VULNERABLE:\nvoid main() { char buf[8]; strcpy(buf, input); }\n\n### FIXED:\n' \
             --max-tokens 100 > results/repair_test.txt
           cat results/repair_test.txt
 
@@ -96,12 +82,3 @@ jobs:
           path: |
             results/
             adapters_dora/
-
-      - name: 8. Update Cache
-        if: success()
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            adapters_dora
-            venv
-          key: cve-dora-v2-${{ github.run_id }}
