@@ -1,12 +1,12 @@
-name: "USENIX-AE: Mamba-Hard-Code-Pretrain"
+name: "USENIX-AE: Mamba-DoRA-Hard-Code"
 
 on:
   workflow_dispatch:
     inputs:
       reason:
-        description: 'Hard Dataset Run'
+        description: 'DoRA Hard Dataset Run'
         required: false
-        default: 'Big-Vul C++ Training'
+        default: 'Big-Vul C++ DoRA Training'
 
 jobs:
   research-marathon:
@@ -20,9 +20,8 @@ jobs:
         run: |
           python3 -m venv venv
           source venv/bin/activate
-          # mlx-lm[train] is the engine for our Mamba model
           pip install "mlx-lm[train]" datasets huggingface_hub
-          mkdir -p data/big_vul adapters_hard results
+          mkdir -p data/big_vul adapters_dora results
 
       - name: 3. Extract Vulnerable Code (MickyMike/cvefixes_bigvul)
         run: |
@@ -31,83 +30,76 @@ jobs:
           from datasets import load_dataset
           import json, os, random
           try:
-              print('🛰️ Pulling Big-Vul Mirror - Real C/C++ Patches...')
-              # We use the verified MickyMike mirror to avoid 404 errors
+              print('🛰️ Pulling Big-Vul Mirror...')
               ds = load_dataset('MickyMike/cvefixes_bigvul', split='train', streaming=True)
               buffer = []
-              
               for i, entry in enumerate(ds.take(20000)):
                   vuln_code = entry.get('source', '')
                   fixed_code = entry.get('target', '')
                   cwe = entry.get('cwe_id', 'Unknown')
-                  
                   if vuln_code and fixed_code:
-                      # Format: Input the bug, output the fix. 
-                      # This forces the model to learn 'Security Logic'.
                       text = f'### VULNERABLE C++:\n{vuln_code}\n\n### CWE TYPE: {cwe}\n\n### FIXED CODE:\n{fixed_code}'
                       buffer.append({'text': text})
-              
               random.shuffle(buffer)
               with open('data/big_vul/train.jsonl', 'w') as f:
                   for line in buffer: f.write(json.dumps(line) + '\n')
-              
               os.system('cp data/big_vul/train.jsonl data/big_vul/valid.jsonl')
-              print(f'✅ Successfully prepared {len(buffer)} code-patch pairs.')
+              print(f'✅ Prepared {len(buffer)} pairs.')
           except Exception as e:
-              print(f'❌ Data Extraction failed: {e}'); exit(1)
+              print(f'❌ Error: {e}'); exit(1)
           "
 
-      - name: 4. Restore "Hardened" State
+      - name: 4. Restore State
         uses: actions/cache/restore@v4
         with:
           path: |
-            adapters_hard
+            adapters_dora
             venv
-          key: cve-hard-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-dora-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            cve-hard-v2-
+            cve-dora-v1-
 
-      - name: 5. Execute Hard Training (Context 2048)
+      - name: 5. Execute DoRA Training (Context 2048)
         run: |
           source venv/bin/activate
-          # Code requires a larger context window (2048) than text
-          python3 -m mlx_lm.lora \
+          # Updated to non-deprecated calling convention + DoRA flag
+          python -m mlx_lm lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
+            --fine-tune-type dora \
             --data data/big_vul \
             --iters 100000 \
             --save-every 100 \
             --batch-size 2 \
             --max-seq-length 2048 \
-            --adapter-path adapters_hard | tee results/hard_train_log.txt
+            --adapter-path adapters_dora | tee results/dora_train_log.txt
 
-      - name: 6. Automated Audit Test (Inference)
+      - name: 6. Automated Audit Test
         if: always()
         run: |
           source venv/bin/activate
-          echo "📊 Testing Zero-Shot Vulnerability Repair..."
-          # We provide a classic buffer overflow to see if the model learned to fix it
-          python3 -m mlx_lm.generate \
+          echo "📊 Testing DoRA Vulnerability Repair..."
+          python -m mlx_lm generate \
             --model mlx-community/mamba-130m-hf-bf16 \
-            --adapter-path adapters_hard \
+            --adapter-path adapters_dora \
             --prompt '### VULNERABLE C++:\nvoid main() { char buf[8]; strcpy(buf, input); }\n\n### FIXED CODE:\n' \
             --max-tokens 100 > results/repair_test.txt
           cat results/repair_test.txt
 
-      - name: 7. Save & Upload Artifacts
+      - name: 7. Save & Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hard-mamba-results
+          name: dora-mamba-results
           path: |
             results/
-            adapters_hard/
+            adapters_dora/
       
-      - name: 8. Update Persistent Cache
+      - name: 8. Update Cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            adapters_hard
+            adapters_dora
             venv
-          key: cve-hard-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-dora-v1-${{ github.run_id }}-${{ github.run_attempt }}
