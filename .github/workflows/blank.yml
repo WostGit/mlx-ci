@@ -1,97 +1,93 @@
-name: CVE Expert 6-Hour Marathon
+name: USENIX-AE: CVE-Mamba Research Pipeline
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
 
 jobs:
-  train:
+  research-run:
     runs-on: macos-26
     timeout-minutes: 355
     steps:
-      - name: Checkout Repository
+      - name: 1. Clone Research Artifact
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          # REMOVED: cache: 'pip' (This was causing the crash)
-
-      - name: Install AI Stack
+      - name: 2. Install Dependencies
         run: |
           python3 -m pip install --upgrade pip
-          # We install directly; GitHub handles the environment
-          python3 -m pip install "mlx-lm[train]" datasets huggingface_hub
-          mkdir -p data/cve_cpt adapters_dora
+          python3 -m pip install "mlx-lm[train]" datasets huggingface_hub pandas matplotlib
+          mkdir -p data/cve_cpt adapters_dora results
 
-      - name: Stream Real CVE Dataset
+      - name: 3. Establish Baseline (Untrained Model)
+        run: |
+          echo "📊 COLLECTING BASELINE INFERENCE..."
+          python3 -m mlx_lm.generate \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
+            --max-tokens 50 > results/baseline_response.txt
+
+      - name: 4. Stream & Shuffle Research Dataset (50k)
         run: |
           python3 -c "
           from datasets import load_dataset
-          import json, os
-          try:
-              print('🛰️ Streaming 5,000 real-world CVEs...')
-              ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
-              with open('data/cve_cpt/train.jsonl', 'w') as f:
-                  for i, entry in enumerate(ds.take(5000)):
-                      cve = entry.get('CVE', 'Unknown')
-                      desc = entry.get('Description', 'N/A').replace('\n', ' ')
-                      payload = {'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply vendor patches.'}
-                      f.write(json.dumps(payload) + '\n')
-              os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
-              print(f'✅ {i+1} records prepared.')
-          except Exception as e:
-              print(f'❌ Data Stream Error: {e}'); exit(1)
+          import json, os, random
+          ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
+          buffer = [{'text': f'### VULNERABILITY: {ex.get(\"CVE\")}\n### DESCRIPTION: {ex.get(\"Description\").replace(\"\n\", \" \")}\n### MITIGATION: Patch.'} for ex in ds.take(50000)]
+          random.shuffle(buffer)
+          with open('data/cve_cpt/train.jsonl', 'w') as f:
+              for line in buffer: f.write(json.dumps(line) + '\n')
+          os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
           "
 
-      - name: Restore Previous Day Brain
+      - name: 5. Restore Model Checkpoint
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
-          # This key structure ensures we always pull the most recent successful run
-          key: cve-brain-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            cve-brain-v2-
+          key: cve-artifact-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: cve-artifact-v3-
 
-      - name: 6-Hour Continuous Training
+      - name: 6. Execute 6-Hour Training Marathon
         run: |
           RESUME_ARG=""
-          # Check for both the weights and the config file before resuming
-          if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "🎯 RESUMING: Previous Brain weights detected."
-            RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
-          fi
-
+          [ -f "adapters_dora/adapter_config.json" ] && RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
+          
+          # Pipe logs to a file so we can parse them later
           python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
-            --train \
-            --fine-tune-type dora \
-            --data data/cve_cpt \
-            --iters 20000 \
-            --save-every 100 \
-            --batch-size 4 \
-            --max-seq-length 1024 \
-            --adapter-path adapters_dora \
-            $RESUME_ARG
+            --train --fine-tune-type dora --data data/cve_cpt \
+            --iters 50000 --save-every 100 --batch-size 4 --max-seq-length 1024 \
+            --adapter-path adapters_dora $RESUME_ARG | tee results/training_log.txt
 
-      - name: Test the Brain (Inference)
+      - name: 7. Artifact Evaluation (Trained Model)
         if: always()
         run: |
           if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "--- Testing Knowledge: Log4j (CVE-2021-44228) ---"
+            echo "🎯 EVALUATING TRAINED ARTIFACT..."
             python3 -m mlx_lm.generate \
               --model mlx-community/mamba-130m-hf-bf16 \
               --adapter-path adapters_dora \
               --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
-              --max-tokens 100
-          else
-            echo "⏭️ Skipping test: No adapter config found yet."
+              --max-tokens 50 > results/artifact_response.txt
+            
+            echo "--- BASELINE (Untrained) ---"
+            cat results/baseline_response.txt
+            echo "--- ARTIFACT (Trained) ---"
+            cat results/artifact_response.txt
           fi
 
-      - name: Save Evolved Brain
+      - name: 8. Export Research Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: research-results-${{ github.run_id }}
+          path: |
+            results/
+            adapters_dora/adapter_config.json
+            adapters_dora/adapters.safetensors
+
+      - name: 9. Save Persistent State
         if: always()
         uses: actions/cache/save@v4
         with:
           path: adapters_dora
-          key: cve-brain-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-artifact-v3-${{ github.run_id }}-${{ github.run_attempt }}
