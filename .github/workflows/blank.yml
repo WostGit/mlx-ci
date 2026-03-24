@@ -1,8 +1,14 @@
-name: USENIX-AE: CVE-Mamba Research Pipeline
+name: "USENIX-AE: CVE-Mamba Research Pipeline"
+
 on:
-  workflow_dispatch: # Allows manual triggering from the UI
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Manual Run Reason'
+        required: false
+        default: 'Training Marathon'
   schedule:
-    - cron: '0 0 * * *' # Automated daily training
+    - cron: '0 0 * * *'
 
 jobs:
   research-marathon:
@@ -12,27 +18,27 @@ jobs:
       - name: 1. Clone Research Artifact
         uses: actions/checkout@v4
 
-      - name: 2. Install Dependencies
+      - name: 2. Set up Environment
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install "mlx-lm[train]" datasets huggingface_hub pandas matplotlib
+          python3 -m pip install "mlx-lm[train]" datasets huggingface_hub
           mkdir -p data/cve_cpt adapters_dora results
 
-      - name: 3. Establish Baseline (Untrained Model)
+      - name: 3. Establish Baseline (Untrained)
         run: |
-          echo "📊 Establishing Baseline for Artifact Evaluation..."
+          echo "📊 Capturing Untrained Model Response..."
           python3 -m mlx_lm.generate \
             --model mlx-community/mamba-130m-hf-bf16 \
             --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
             --max-tokens 50 > results/baseline_response.txt
 
-      - name: 4. Stream & Shuffle Research Dataset (50k)
+      - name: 4. Stream & Shuffle Dataset (50k)
         run: |
           python3 -c "
           from datasets import load_dataset
           import json, os, random
           try:
-              print('🛰️ Streaming 50,000 real-world CVEs...')
+              print('🛰️ Streaming 50,000 CVEs...')
               ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
               buffer = []
               for i, entry in enumerate(ds.take(50000)):
@@ -45,28 +51,27 @@ jobs:
                   for line in buffer: f.write(json.dumps(line) + '\n')
               
               os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
-              print(f'✅ {len(buffer)} records shuffled and ready.')
+              print(f'✅ Shuffled {len(buffer)} records.')
           except Exception as e:
-              print(f'❌ Data Stream Error: {e}'); exit(1)
+              print(f'❌ Stream failed: {e}'); exit(1)
           "
 
-      - name: 5. Restore Persistent State
+      - name: 5. Restore Previous Brain State
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
-          key: cve-artifact-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-brain-v5-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            cve-artifact-v4-
+            cve-brain-v5-
 
-      - name: 6. Execute 6-Hour Training Marathon
+      - name: 6. Execute 6-Hour Training
         run: |
           RESUME_ARG=""
           if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "🎯 RESUMING: Previous Brain weights detected."
+            echo "🎯 RESUMING: Previous weights found."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
           fi
 
-          # High iters ensures we use the full 6-hour window
           python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
@@ -79,35 +84,35 @@ jobs:
             --adapter-path adapters_dora \
             $RESUME_ARG | tee results/training_log.txt
 
-      - name: 7. Artifact Evaluation (Trained Model)
+      - name: 7. Qualitative Evaluation (Final)
         if: always()
         run: |
           if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "🎯 Evaluating Trained Artifact..."
+            echo "🎯 Generating Post-Training Response..."
             python3 -m mlx_lm.generate \
               --model mlx-community/mamba-130m-hf-bf16 \
               --adapter-path adapters_dora \
               --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
               --max-tokens 50 > results/artifact_response.txt
             
-            echo "--- BASELINE (Untrained) ---"
+            echo "--- BASELINE (Pre-Training) ---"
             cat results/baseline_response.txt
-            echo "--- ARTIFACT (Trained) ---"
+            echo "--- ARTIFACT (Post-Training) ---"
             cat results/artifact_response.txt
           fi
 
-      - name: 8. Upload Research Artifacts
+      - name: 8. Archive Research Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: research-results-${{ github.run_id }}
+          name: cve-mamba-results
           path: |
             results/
             adapters_dora/
 
-      - name: 9. Save Persistent State
+      - name: 9. Save Persistent Brain State
         if: always()
         uses: actions/cache/save@v4
         with:
           path: adapters_dora
-          key: cve-brain-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-brain-v5-${{ github.run_id }}-${{ github.run_attempt }}
