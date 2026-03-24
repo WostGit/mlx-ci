@@ -9,57 +9,61 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 355
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: 'pip' # Speeds up subsequent runs
+          # REMOVED: cache: 'pip' (This was causing the crash)
 
       - name: Install AI Stack
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install "mlx-lm[train]" datasets huggingface_hub
+          python3 -m pip install --upgrade pip
+          # We install directly; GitHub handles the environment
+          python3 -m pip install "mlx-lm[train]" datasets huggingface_hub
           mkdir -p data/cve_cpt adapters_dora
 
       - name: Stream Real CVE Dataset
         run: |
-          python -c "
+          python3 -c "
           from datasets import load_dataset
           import json, os
           try:
-              print('🛰️ Streaming real-world CVE data...')
+              print('🛰️ Streaming 5,000 real-world CVEs...')
               ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
               with open('data/cve_cpt/train.jsonl', 'w') as f:
                   for i, entry in enumerate(ds.take(5000)):
                       cve = entry.get('CVE', 'Unknown')
                       desc = entry.get('Description', 'N/A').replace('\n', ' ')
-                      payload = {'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply patches.'}
+                      payload = {'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply vendor patches.'}
                       f.write(json.dumps(payload) + '\n')
               os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
-              print(f'✅ {i+1} records ready.')
+              print(f'✅ {i+1} records prepared.')
           except Exception as e:
-              print(f'❌ Stream failed: {e}'); exit(1)
+              print(f'❌ Data Stream Error: {e}'); exit(1)
           "
 
       - name: Restore Previous Day Brain
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
+          # This key structure ensures we always pull the most recent successful run
           key: cve-brain-v2-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: cve-brain-v2-
+          restore-keys: |
+            cve-brain-v2-
 
       - name: 6-Hour Continuous Training
         run: |
           RESUME_ARG=""
+          # Check for both the weights and the config file before resuming
           if [ -f "adapters_dora/adapter_config.json" ]; then
             echo "🎯 RESUMING: Previous Brain weights detected."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
           fi
 
-          python -m mlx_lm.lora \
+          python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --fine-tune-type dora \
@@ -75,14 +79,14 @@ jobs:
         if: always()
         run: |
           if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "--- Evaluation: Log4j (CVE-2021-44228) ---"
-            python -m mlx_lm.generate \
+            echo "--- Testing Knowledge: Log4j (CVE-2021-44228) ---"
+            python3 -m mlx_lm.generate \
               --model mlx-community/mamba-130m-hf-bf16 \
               --adapter-path adapters_dora \
               --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
               --max-tokens 100
           else
-            echo "⏭️ Skipping test: No adapter file created yet."
+            echo "⏭️ Skipping test: No adapter config found yet."
           fi
 
       - name: Save Evolved Brain
