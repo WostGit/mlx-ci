@@ -1,12 +1,12 @@
-name: "USENIX-AE: CVE-Mamba Pretrain From Scratch"
+name: "USENIX-AE: Mamba-Hard-Code-Pretrain"
 
 on:
   workflow_dispatch:
     inputs:
       reason:
-        description: 'Manual Run Reason'
+        description: 'Hard Dataset Run'
         required: false
-        default: 'Scratch Pretraining'
+        default: 'Big-Vul C++ Training'
 
 jobs:
   research-marathon:
@@ -18,81 +18,95 @@ jobs:
 
       - name: 2. Set up Environment (Stable Venv)
         run: |
-          # Create a virtual environment to avoid Homebrew/System Python conflicts
           python3 -m venv venv
           source venv/bin/activate
-          
-          # Install research tools inside the venv
+          # Adding 'tree-sitter' can help with code parsing if you expand this later
           pip install "mlx-lm[train]" datasets huggingface_hub
-          
-          # Verify MLX can see the GPU (M-series chip)
-          python -c "import mlx.core as mx; print(f'✅ MLX is active on: {mx.default_device()}')"
-          
-          mkdir -p data/cve_cpt adapters_scratch results
+          mkdir -p data/big_vul adapters_hard results
 
-      - name: 3. Stream & Shuffle Dataset (50k)
+      - name: 3. Extract Vulnerable Code (Big-Vul)
         run: |
           source venv/bin/activate
           python3 -c "
           from datasets import load_dataset
           import json, os, random
           try:
-              print('🛰️ Streaming 50,000 CVEs...')
-              ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
+              print('🛰️ Pulling Big-Vul (MSR 2020) - Real C/C++ Vulnerabilities...')
+              # We use the 'train' split of a high-quality vulnerability dataset
+              ds = load_dataset('claudios/Big-Vul', split='train', streaming=True)
               buffer = []
-              for i, entry in enumerate(ds.take(50000)):
-                  cve = entry.get('CVE', 'Unknown')
-                  desc = entry.get('Description', 'N/A').replace('\n', ' ')
-                  buffer.append({'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Patch.'})
+              
+              # We take 20,000 high-quality code samples
+              for i, entry in enumerate(ds.take(20000)):
+                  vuln_code = entry.get('func_before', '')
+                  fixed_code = entry.get('func_after', '')
+                  cwe = entry.get('vul_type', 'Unknown')
+                  
+                  if vuln_code and fixed_code:
+                      # Hard Reasoning Format: Input the bug, predict the fix
+                      text = f'### VULNERABLE C++:\n{vuln_code}\n\n### CWE TYPE: {cwe}\n\n### FIXED CODE:\n{fixed_code}'
+                      buffer.append({'text': text})
               
               random.shuffle(buffer)
-              with open('data/cve_cpt/train.jsonl', 'w') as f:
+              with open('data/big_vul/train.jsonl', 'w') as f:
                   for line in buffer: f.write(json.dumps(line) + '\n')
               
-              os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
-              print(f'✅ Ready: {len(buffer)} records.')
+              os.system('cp data/big_vul/train.jsonl data/big_vul/valid.jsonl')
+              print(f'✅ Processed {len(buffer)} code-patch pairs.')
           except Exception as e:
-              print(f'❌ Stream failed: {e}'); exit(1)
+              print(f'❌ Data Extraction failed: {e}'); exit(1)
           "
 
       - name: 4. Restore State
         uses: actions/cache/restore@v4
         with:
           path: |
-            adapters_scratch
+            adapters_hard
             venv
-          key: cve-scratch-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-hard-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            cve-scratch-v2-
+            cve-hard-v1-
 
-      - name: 5. Execute Pretraining
+      - name: 5. Execute Hard Pretraining
         run: |
           source venv/bin/activate
-          # Pretraining from scratch logic
+          # We increase max-seq-length to 2048 because code functions are longer than descriptions
           python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
-            --data data/cve_cpt \
+            --data data/big_vul \
             --iters 100000 \
             --save-every 100 \
-            --batch-size 4 \
-            --max-seq-length 1024 \
-            --adapter-path adapters_scratch | tee results/pretrain_log.txt
+            --batch-size 2 \
+            --max-seq-length 2048 \
+            --adapter-path adapters_hard | tee results/hard_train_log.txt
 
-      - name: 6. Archive Results
+      - name: 6. Automated Audit Test
+        if: always()
+        run: |
+          source venv/bin/activate
+          echo "📊 Testing Zero-Shot Vulnerability Repair..."
+          python3 -m mlx_lm.generate \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --adapter-path adapters_hard \
+            --prompt '### VULNERABLE C++:\nvoid main() { char buf[8]; strcpy(buf, input); }\n\n### FIXED CODE:\n' \
+            --max-tokens 100 > results/repair_test.txt
+          cat results/repair_test.txt
+
+      - name: 7. Save & Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cve-mamba-scratch-results
+          name: hard-mamba-results
           path: |
             results/
-            adapters_scratch/
-
-      - name: 7. Save State
+            adapters_hard/
+      
+      - name: 8. Update Persistent Cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: |
-            adapters_scratch
+            adapters_hard
             venv
-          key: cve-scratch-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-hard-v1-${{ github.run_id }}-${{ github.run_attempt }}
