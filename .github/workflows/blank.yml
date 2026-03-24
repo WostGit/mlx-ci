@@ -1,11 +1,11 @@
 name: USENIX-AE: CVE-Mamba Research Pipeline
 on:
-  workflow_dispatch:
+  workflow_dispatch: # Allows manual triggering from the UI
   schedule:
-    - cron: '0 0 * * *'
+    - cron: '0 0 * * *' # Automated daily training
 
 jobs:
-  research-run:
+  research-marathon:
     runs-on: macos-26
     timeout-minutes: 355
     steps:
@@ -20,7 +20,7 @@ jobs:
 
       - name: 3. Establish Baseline (Untrained Model)
         run: |
-          echo "📊 COLLECTING BASELINE INFERENCE..."
+          echo "📊 Establishing Baseline for Artifact Evaluation..."
           python3 -m mlx_lm.generate \
             --model mlx-community/mamba-130m-hf-bf16 \
             --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
@@ -31,38 +31,59 @@ jobs:
           python3 -c "
           from datasets import load_dataset
           import json, os, random
-          ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
-          buffer = [{'text': f'### VULNERABILITY: {ex.get(\"CVE\")}\n### DESCRIPTION: {ex.get(\"Description\").replace(\"\n\", \" \")}\n### MITIGATION: Patch.'} for ex in ds.take(50000)]
-          random.shuffle(buffer)
-          with open('data/cve_cpt/train.jsonl', 'w') as f:
-              for line in buffer: f.write(json.dumps(line) + '\n')
-          os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
+          try:
+              print('🛰️ Streaming 50,000 real-world CVEs...')
+              ds = load_dataset('Bouquets/Cybersecurity-LLM-CVE', split='train', streaming=True)
+              buffer = []
+              for i, entry in enumerate(ds.take(50000)):
+                  cve = entry.get('CVE', 'Unknown')
+                  desc = entry.get('Description', 'N/A').replace('\n', ' ')
+                  buffer.append({'text': f'### VULNERABILITY: {cve}\n### DESCRIPTION: {desc}\n### MITIGATION: Patch.'})
+              
+              random.shuffle(buffer)
+              with open('data/cve_cpt/train.jsonl', 'w') as f:
+                  for line in buffer: f.write(json.dumps(line) + '\n')
+              
+              os.system('cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl')
+              print(f'✅ {len(buffer)} records shuffled and ready.')
+          except Exception as e:
+              print(f'❌ Data Stream Error: {e}'); exit(1)
           "
 
-      - name: 5. Restore Model Checkpoint
+      - name: 5. Restore Persistent State
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
-          key: cve-artifact-v3-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: cve-artifact-v3-
+          key: cve-artifact-v4-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            cve-artifact-v4-
 
       - name: 6. Execute 6-Hour Training Marathon
         run: |
           RESUME_ARG=""
-          [ -f "adapters_dora/adapter_config.json" ] && RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
-          
-          # Pipe logs to a file so we can parse them later
+          if [ -f "adapters_dora/adapter_config.json" ]; then
+            echo "🎯 RESUMING: Previous Brain weights detected."
+            RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
+          fi
+
+          # High iters ensures we use the full 6-hour window
           python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
-            --train --fine-tune-type dora --data data/cve_cpt \
-            --iters 50000 --save-every 100 --batch-size 4 --max-seq-length 1024 \
-            --adapter-path adapters_dora $RESUME_ARG | tee results/training_log.txt
+            --train \
+            --fine-tune-type dora \
+            --data data/cve_cpt \
+            --iters 100000 \
+            --save-every 100 \
+            --batch-size 4 \
+            --max-seq-length 1024 \
+            --adapter-path adapters_dora \
+            $RESUME_ARG | tee results/training_log.txt
 
       - name: 7. Artifact Evaluation (Trained Model)
         if: always()
         run: |
           if [ -f "adapters_dora/adapter_config.json" ]; then
-            echo "🎯 EVALUATING TRAINED ARTIFACT..."
+            echo "🎯 Evaluating Trained Artifact..."
             python3 -m mlx_lm.generate \
               --model mlx-community/mamba-130m-hf-bf16 \
               --adapter-path adapters_dora \
@@ -75,19 +96,18 @@ jobs:
             cat results/artifact_response.txt
           fi
 
-      - name: 8. Export Research Artifacts
+      - name: 8. Upload Research Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: research-results-${{ github.run_id }}
           path: |
             results/
-            adapters_dora/adapter_config.json
-            adapters_dora/adapters.safetensors
+            adapters_dora/
 
       - name: 9. Save Persistent State
         if: always()
         uses: actions/cache/save@v4
         with:
           path: adapters_dora
-          key: cve-artifact-v3-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-brain-v4-${{ github.run_id }}-${{ github.run_attempt }}
