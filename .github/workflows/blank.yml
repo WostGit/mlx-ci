@@ -2,96 +2,90 @@ name: CVE Expert 6-Hour Marathon
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * *' # Midnight "Brain Boost"
+    - cron: '0 0 * * *' # Automated daily "Deep Learning" session
 
 jobs:
   train:
-    runs-on: macos-26 # Using the latest 2026 Tahoe runners
-    timeout-minutes: 355 # GitHub hard limit is 360; 5 mins buffer for caching
+    runs-on: macos-26
+    timeout-minutes: 355
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install MLX & Datasets
+      - name: Install AI Stack
         run: |
           pip install "mlx-lm[train]" datasets huggingface_hub
-          # Ensure directories exist
-          mkdir -p data/cve_cpt
-          mkdir -p adapters_dora
+          mkdir -p data/cve_cpt adapters_dora
 
-      - name: Inspect Runner Hardware
+      - name: Stream Real CVE Dataset
         run: |
-          echo "--- Silicon Identity ---"
-          sysctl -n machdep.cpu.brand_string
-          echo "--- RAM Available ---"
-          sysctl hw.memsize | awk '{print $2/1024/1024/1024 " GB"}'
-
-      - name: Stream Real CVE Dataset from HF
-        run: |
-          python3 -c '
+          python3 -c '''
           from datasets import load_dataset
-          import json
-          import os
-
+          import json, os
           print("🛰️ Connecting to Hugging Face...")
-          # Streaming=True allows us to process 124k+ rows without downloading the whole file
-          ds = load_dataset("Bouquets/Cybersecurity-LLM-CVE", split="train", streaming=True)
-          
-          def format_cve(ex):
-              # Structural instruction tuning for Mamba
-              return {"text": f"### VULNERABILITY: {ex.get(\"CVE\", \"Unknown\")}\n### DESCRIPTION: {ex.get(\"Description\", \"N/A\")}\n### MITIGATION: Apply vendor updates immediately."}
+          try:
+              ds = load_dataset("Bouquets/Cybersecurity-LLM-CVE", split="train", streaming=True)
+              
+              def format_cve(ex):
+                  cve_id = ex.get("CVE", "Unknown")
+                  desc = ex.get("Description", "No description available.")
+                  # Clean newline characters to keep JSONL valid
+                  desc = desc.replace("\n", " ").strip()
+                  return {"text": f"### VULNERABILITY: {cve_id}\n### DESCRIPTION: {desc}\n### MITIGATION: Apply vendor updates."}
 
-          count = 0
-          with open("data/cve_cpt/train.jsonl", "w") as f:
-              for entry in ds.take(5000): # Take a 5k chunk for the 6-hour window
-                  f.write(json.dumps(format_cve(entry)) + "\n")
-                  count += 1
-          
-          print(f"✅ Prepared {count} real CVE records.")
-          # Use same data for validation in this loop
-          os.system("cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl")
-          '
+              with open("data/cve_cpt/train.jsonl", "w") as f:
+                  for i, entry in enumerate(ds.take(5000)):
+                      f.write(json.dumps(format_cve(entry)) + "\n")
+              
+              os.system("cp data/cve_cpt/train.jsonl data/cve_cpt/valid.jsonl")
+              print(f"✅ Dataset Prepared with {i+1} records.")
+          except Exception as e:
+              print(f"❌ Data Stream Error: {e}")
+              exit(1)
+          '''
 
       - name: Restore Evolution Cache
-        id: cache-restore
         uses: actions/cache/restore@v4
         with:
           path: adapters_dora
-          # We use a base key and a fallback to keep the "Brain" evolving
           key: cve-brain-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             cve-brain-v2-
 
-      - name: 6-Hour Continuous DoRA Training
+      - name: 6-Hour Continuous Training
         run: |
           RESUME_ARG=""
           if [ -f "adapters_dora/adapters.safetensors" ]; then
             echo "🎯 RESUMING: Previous Brain weights detected."
             RESUME_ARG="--resume-adapter-file adapters_dora/adapters.safetensors"
-          else
-            echo "🌱 STARTING FRESH: No previous weights found in cache."
           fi
 
-          # 10k iters is a ceiling; the 355m timeout will stop it gracefully
+          # High iters; the timeout-minutes handles the 6-hour exit
           mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
             --fine-tune-type dora \
             --data data/cve_cpt \
-            --iters 10000 \
+            --iters 20000 \
             --save-every 100 \
             --batch-size 4 \
             --max-seq-length 1024 \
             --adapter-path adapters_dora \
             $RESUME_ARG
 
+      - name: Test the Brain (Inference)
+        if: always()
+        run: |
+          echo "--- Testing Model Knowledge ---"
+          # This checks if the model actually "absorbed" the Log4j info
+          mlx_lm.generate \
+            --model mlx-community/mamba-130m-hf-bf16 \
+            --adapter-path adapters_dora \
+            --prompt "### VULNERABILITY: CVE-2021-44228\n### DESCRIPTION:" \
+            --max-tokens 100
+
       - name: Save Evolved Brain
-        if: always() # CRITICAL: Save weights even if the 6-hour timeout triggers
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: adapters_dora
