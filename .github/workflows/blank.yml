@@ -20,30 +20,30 @@ jobs:
         run: |
           python3 -m venv venv
           source venv/bin/activate
-          # Adding 'tree-sitter' can help with code parsing if you expand this later
+          # mlx-lm[train] is the engine for our Mamba model
           pip install "mlx-lm[train]" datasets huggingface_hub
           mkdir -p data/big_vul adapters_hard results
 
-      - name: 3. Extract Vulnerable Code (Big-Vul)
+      - name: 3. Extract Vulnerable Code (MickyMike/cvefixes_bigvul)
         run: |
           source venv/bin/activate
           python3 -c "
           from datasets import load_dataset
           import json, os, random
           try:
-              print('🛰️ Pulling Big-Vul (MSR 2020) - Real C/C++ Vulnerabilities...')
-              # We use the 'train' split of a high-quality vulnerability dataset
-              ds = load_dataset('claudios/Big-Vul', split='train', streaming=True)
+              print('🛰️ Pulling Big-Vul Mirror - Real C/C++ Patches...')
+              # We use the verified MickyMike mirror to avoid 404 errors
+              ds = load_dataset('MickyMike/cvefixes_bigvul', split='train', streaming=True)
               buffer = []
               
-              # We take 20,000 high-quality code samples
               for i, entry in enumerate(ds.take(20000)):
-                  vuln_code = entry.get('func_before', '')
-                  fixed_code = entry.get('func_after', '')
-                  cwe = entry.get('vul_type', 'Unknown')
+                  vuln_code = entry.get('source', '')
+                  fixed_code = entry.get('target', '')
+                  cwe = entry.get('cwe_id', 'Unknown')
                   
                   if vuln_code and fixed_code:
-                      # Hard Reasoning Format: Input the bug, predict the fix
+                      # Format: Input the bug, output the fix. 
+                      # This forces the model to learn 'Security Logic'.
                       text = f'### VULNERABLE C++:\n{vuln_code}\n\n### CWE TYPE: {cwe}\n\n### FIXED CODE:\n{fixed_code}'
                       buffer.append({'text': text})
               
@@ -52,25 +52,25 @@ jobs:
                   for line in buffer: f.write(json.dumps(line) + '\n')
               
               os.system('cp data/big_vul/train.jsonl data/big_vul/valid.jsonl')
-              print(f'✅ Processed {len(buffer)} code-patch pairs.')
+              print(f'✅ Successfully prepared {len(buffer)} code-patch pairs.')
           except Exception as e:
               print(f'❌ Data Extraction failed: {e}'); exit(1)
           "
 
-      - name: 4. Restore State
+      - name: 4. Restore "Hardened" State
         uses: actions/cache/restore@v4
         with:
           path: |
             adapters_hard
             venv
-          key: cve-hard-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-hard-v2-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            cve-hard-v1-
+            cve-hard-v2-
 
-      - name: 5. Execute Hard Pretraining
+      - name: 5. Execute Hard Training (Context 2048)
         run: |
           source venv/bin/activate
-          # We increase max-seq-length to 2048 because code functions are longer than descriptions
+          # Code requires a larger context window (2048) than text
           python3 -m mlx_lm.lora \
             --model mlx-community/mamba-130m-hf-bf16 \
             --train \
@@ -81,11 +81,12 @@ jobs:
             --max-seq-length 2048 \
             --adapter-path adapters_hard | tee results/hard_train_log.txt
 
-      - name: 6. Automated Audit Test
+      - name: 6. Automated Audit Test (Inference)
         if: always()
         run: |
           source venv/bin/activate
           echo "📊 Testing Zero-Shot Vulnerability Repair..."
+          # We provide a classic buffer overflow to see if the model learned to fix it
           python3 -m mlx_lm.generate \
             --model mlx-community/mamba-130m-hf-bf16 \
             --adapter-path adapters_hard \
@@ -93,7 +94,7 @@ jobs:
             --max-tokens 100 > results/repair_test.txt
           cat results/repair_test.txt
 
-      - name: 7. Save & Upload
+      - name: 7. Save & Upload Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -109,4 +110,4 @@ jobs:
           path: |
             adapters_hard
             venv
-          key: cve-hard-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          key: cve-hard-v2-${{ github.run_id }}-${{ github.run_attempt }}
